@@ -1,0 +1,45 @@
+[project]
+name = "whistle-house"
+version = "0.1.0"
+description = "Whistled-tune detection for home automation, built from swappable pipeline stages"
+readme = "README.md"
+authors = [
+    { name = "Aidan Dempster", email = "aidan.dempster@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "soundfile>=0.12",
+    "sounddevice>=0.5",
+    "pydantic>=2.9",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Learned whistle detector training + inference.
+ml = ["torch>=2.5"]
+
+[project.scripts]
+whistle-house = "whistle_house.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+    # Only used to verify our numpy mel filterbank matches librosa's.
+    "librosa>=0.10",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
