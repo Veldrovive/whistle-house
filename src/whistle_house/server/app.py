@@ -75,7 +75,7 @@ class TrainBody(BaseModel):
 
 
 class AppState:
-    def __init__(self, paths: Paths, device: str | None, live: bool):
+    def __init__(self, paths: Paths, device: str | None, live: bool, replay: str | None = None):
         self.paths = paths.ensure()
         self.recordings = RecordingStore(paths.recordings)
         self.tunes = TuneLibrary(paths.tunes)
@@ -83,7 +83,9 @@ class AppState:
         self.pipelines = PipelineStore(paths.pipelines)
         self.state = json.loads(paths.state.read_text()) if paths.state.exists() else {}
         self.device = device or self.state.get("device")
-        self.engine = LiveEngine(paths, self.tunes, self.outputs, self.recordings, self.device)
+        self.engine = LiveEngine(
+            paths, self.tunes, self.outputs, self.recordings, self.device, replay=replay
+        )
         self.live = live
         self.training: dict[str, subprocess.Popen] = {}
 
@@ -98,8 +100,13 @@ class AppState:
             return self.pipelines.list()[0]
 
 
-def create_app(paths: Paths | None = None, device: str | None = None, live: bool = True) -> FastAPI:
-    S = AppState(paths or default_paths(), device, live)
+def create_app(
+    paths: Paths | None = None,
+    device: str | None = None,
+    live: bool = True,
+    replay: str | None = None,
+) -> FastAPI:
+    S = AppState(paths or default_paths(), device, live, replay)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -468,7 +475,18 @@ def create_app(paths: Paths | None = None, device: str | None = None, live: bool
 
     # ------------------------------------------------------------------ static manager
 
+    # Built manager (cd manager && npm run build). Unknown non-API paths fall back to
+    # index.html so client-side routes (/data, /tunes, ...) survive a reload.
     if MANAGER_DIST.exists():
-        app.mount("/", StaticFiles(directory=MANAGER_DIST, html=True), name="manager")
+        app.mount("/assets", StaticFiles(directory=MANAGER_DIST / "assets"), name="assets")
+
+        @app.get("/{path:path}", include_in_schema=False)
+        def spa(path: str):
+            if path.startswith(("api/", "ws/")):
+                raise HTTPException(404)
+            f = (MANAGER_DIST / path).resolve()
+            if path and f.is_file() and MANAGER_DIST.resolve() in f.parents:
+                return FileResponse(f)
+            return FileResponse(MANAGER_DIST / "index.html")
 
     return app

@@ -21,7 +21,7 @@ def cmd_serve(args) -> None:
 
     from whistle_house.server.app import create_app
 
-    app = create_app(_paths(args), device=args.device, live=not args.no_live)
+    app = create_app(_paths(args), device=args.device, live=not args.no_live, replay=args.replay)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
@@ -94,6 +94,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", help="input device name substring")
     p.add_argument("--no-live", action="store_true", help="don't open the microphone")
+    p.add_argument("--replay", help="loop this audio file in real time instead of using the mic")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("devices", help="list audio input devices")

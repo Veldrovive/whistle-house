@@ -36,6 +36,41 @@ class ArraySource:
             yield self.samples[i : i + self.chunk_size]
 
 
+class ReplaySource:
+    """Plays a signal in real time (looping), standing in for a microphone.
+
+    ``whistle-house serve --replay file.wav`` uses this to exercise the live path without a mic
+    (or while another process owns it).
+    """
+
+    def __init__(
+        self, samples: np.ndarray, sample_rate: int, chunk_size: int = 1024, loop: bool = True
+    ):
+        self.samples = np.asarray(samples, np.float32)
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.loop = loop
+        self._closed = False
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        import time
+
+        period = self.chunk_size / self.sample_rate
+        next_t = time.monotonic()
+        while not self._closed:
+            for i in range(0, len(self.samples) - self.chunk_size + 1, self.chunk_size):
+                if self._closed:
+                    return
+                next_t += period
+                time.sleep(max(0.0, next_t - time.monotonic()))
+                yield self.samples[i : i + self.chunk_size]
+            if not self.loop:
+                return
+
+    def close(self) -> None:
+        self._closed = True
+
+
 class MicSource:
     """Live microphone via sounddevice. Iterate to receive chunks; ``close()`` to stop.
 

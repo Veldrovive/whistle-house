@@ -17,7 +17,8 @@ from collections.abc import Callable
 
 import numpy as np
 
-from whistle_house.audio.sources import MicSource
+from whistle_house.audio.io import load_audio
+from whistle_house.audio.sources import MicSource, ReplaySource
 from whistle_house.data.store import Recording, RecordingStore
 from whistle_house.outputs import OutputStore
 from whistle_house.pipeline import Pipeline, PipelineSpec
@@ -49,7 +50,9 @@ class LiveEngine:
         outputs: OutputStore,
         recordings: RecordingStore,
         device: str | None = None,
+        replay: str | None = None,
     ):
+        self.replay = replay  # audio file to loop instead of opening the mic
         self.paths = paths
         self.tunes = tunes
         self.outputs = outputs
@@ -63,7 +66,7 @@ class LiveEngine:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._source: MicSource | None = None
+        self._source: MicSource | ReplaySource | None = None
         self._ring: deque[np.ndarray] = deque()
         self._ring_len = 0
         self._recording: list[np.ndarray] | None = None
@@ -103,7 +106,11 @@ class LiveEngine:
         if self.state == "running" or self.spec is None:
             return
         try:
-            self._source = MicSource(self.spec.sample_rate, self.spec.chunk_size, self.device)
+            if self.replay:
+                audio, _ = load_audio(self.replay, self.spec.sample_rate)
+                self._source = ReplaySource(audio, self.spec.sample_rate, self.spec.chunk_size)
+            else:
+                self._source = MicSource(self.spec.sample_rate, self.spec.chunk_size, self.device)
         except Exception as e:  # noqa: BLE001 - report to UI instead of crashing
             self.state, self.error = "error", f"could not open microphone: {e}"
             log.error(self.error)
@@ -127,7 +134,7 @@ class LiveEngine:
         return {
             "state": self.state,
             "error": self.error,
-            "device": self.device,
+            "device": f"replay:{self.replay}" if self.replay else self.device,
             "pipeline": self.spec.name if self.spec else None,
             "sample_rate": self.spec.sample_rate if self.spec else None,
             "recording": self._recording is not None,
