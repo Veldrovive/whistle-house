@@ -72,6 +72,10 @@ class TrainBody(BaseModel):
     epochs: int = 20
     steps_per_epoch: int = 100
     batch_size: int = 16
+    mix: str = "mic"  # mic | pretrain | finetune
+    external: list[str] = Field(default_factory=list)  # external dataset names
+    init_from: str | None = None  # model name to fine-tune from
+    workers: int = 2
 
 
 class AppState:
@@ -404,6 +408,20 @@ def create_app(
 
     # ------------------------------------------------------------------ models
 
+    @app.get("/api/datasets")
+    def datasets():
+        """External dataset status. Usually unconfigured on the Pi (fetching happens elsewhere)."""
+        from whistle_house.data.training import MIX_PRESETS
+        from whistle_house.external import dataset_status
+        from whistle_house.settings import external_root
+
+        root = external_root(required=False)
+        return {
+            "root": str(root) if root else None,
+            "datasets": dataset_status(root),
+            "mixes": MIX_PRESETS,
+        }
+
     @app.get("/api/models")
     def models():
         out = []
@@ -439,7 +457,15 @@ def create_app(
             str(body.steps_per_epoch),
             "--batch-size",
             str(body.batch_size),
+            "--mix",
+            body.mix,
+            "--workers",
+            str(body.workers),
         ]
+        if body.external:
+            cmd += ["--external", ",".join(body.external)]
+        if body.init_from:
+            cmd += ["--init-from", body.init_from]
         log_path = S.paths.models / f"{body.name}.log"
         S.training[body.name] = subprocess.Popen(
             cmd, stdout=log_path.open("w"), stderr=subprocess.STDOUT

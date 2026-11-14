@@ -2,13 +2,11 @@
 
 Clean whistles are recorded in a quiet room, so robustness to background sound has to be
 manufactured: every training example is (clean whistle or nothing) + (random interferer at a
-random SNR) + (random gain/EQ/reverb). Interferers come from a ``NoiseBank``:
-
-* negatives recorded on the deployment mic (``speech``/``noise``/``music``/``silence`` labels),
-* external corpora dropped into ``<data_dir>/noise/`` (e.g. MUSAN speech/music/noise, ESC-50,
-  DEMAND, LibriSpeech - see AGENTS.md),
-* synthetic voiced "pseudo-speech" (harmonic stacks + moving formants), which reproduces the
-  property of speech that fooled v1: strong, gliding harmonic peaks.
+random SNR) + (random gain/EQ/reverb). Interferer sources are gathered in
+``data/training.py`` (mic negatives, external datasets, ``data/noise/``); this module provides
+the signal-level primitives and synthetic audio, including voiced "pseudo-speech" (harmonic
+stacks + moving formants), which reproduces the property of speech that fooled v1: strong,
+gliding harmonic peaks.
 
 All functions take a ``np.random.Generator`` so data generation is reproducible.
 """
@@ -17,12 +15,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 from scipy.signal import fftconvolve, lfilter
-
-from whistle_house.audio.io import load_audio
 
 log = logging.getLogger(__name__)
 
@@ -165,51 +160,3 @@ def synth_pseudo_speech(sr: int, duration: float, rng: np.random.Generator) -> n
     )
     out *= syll.astype(np.float32)
     return out / (np.abs(out).max() + 1e-9) * 0.5
-
-
-# --------------------------------------------------------------------------- noise bank
-
-
-class NoiseBank:
-    """Random interferers from files on disk (+ synthetic pseudo-speech)."""
-
-    def __init__(
-        self,
-        sample_rate: int,
-        files: list[Path],
-        synthetic_speech_prob: float = 0.25,
-        max_cache: int = 200,
-    ):
-        self.sr = sample_rate
-        self.files = files
-        self.synthetic_speech_prob = synthetic_speech_prob if files else 1.0
-        self._cache: dict[Path, np.ndarray] = {}
-        self._max_cache = max_cache
-
-    @staticmethod
-    def scan(directories: list[Path]) -> list[Path]:
-        out = []
-        for d in directories:
-            if d.exists():
-                out += [p for p in d.rglob("*") if p.suffix.lower() in AUDIO_EXTS]
-        return sorted(out)
-
-    def _load(self, p: Path) -> np.ndarray:
-        if p not in self._cache:
-            if len(self._cache) >= self._max_cache:
-                self._cache.pop(next(iter(self._cache)))
-            try:
-                self._cache[p] = load_audio(p, self.sr)[0]
-            except Exception as e:  # noqa: BLE001 - corrupt/unsupported file must not kill training
-                log.warning("skipping noise file %s: %s", p, e)
-                self._cache[p] = np.zeros(0, np.float32)
-        return self._cache[p]
-
-    def sample(self, n: int, rng: np.random.Generator) -> np.ndarray:
-        if rng.random() < self.synthetic_speech_prob:
-            return synth_pseudo_speech(self.sr, n / self.sr, rng)
-        for _ in range(5):
-            x = self._load(self.files[int(rng.integers(len(self.files)))])
-            if len(x) and rms(x) > 1e-5:
-                return fit_length(x, n, rng)
-        return synth_pseudo_speech(self.sr, n / self.sr, rng)

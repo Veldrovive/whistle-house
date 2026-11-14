@@ -3,7 +3,7 @@ import pytest
 
 from whistle_house.data.augment import mix_at_snr, rms, synth_pseudo_speech, synth_whistle
 from whistle_house.data.store import RecordingStore
-from whistle_house.data.training import ExampleGenerator, GeneratorConfig
+from whistle_house.data.training import ExampleGenerator, GeneratorConfig, collect_sources
 from whistle_house.pipeline import Pipeline, PipelineSpec, PipelineStore, StageSpec
 from whistle_house.stages.base import list_stages
 from whistle_house.tunes import Tune, TuneLibrary, fit_note_template, split_by_silence
@@ -90,10 +90,14 @@ def test_example_generator_shapes(tmp_path):
     sw = synth_whistle(SR, 3.0, np.random.default_rng(4), n_notes=3)
     rec = store.add(sw.audio, SR, label="whistle", split="train")
     assert store.get(rec.id).label == "whistle"
-    gen = ExampleGenerator(
-        PipelineSpec().frontend_dict(), store, [], config=GeneratorConfig(window_s=1.0)
+    fe = PipelineSpec().frontend_dict()
+    cfg = GeneratorConfig(window_s=1.0)
+    src = collect_sources(
+        fe, ("train",), store=store, label_cache_dir=tmp_path / "c", config=cfg, workers=1
     )
-    assert len(gen.positives) == 1
+    assert len(src.mic_positives) == 1
+    assert (src.mic_positives[0].f0 > 0).mean() > 0.3  # auto-labels found the whistling
+    gen = ExampleGenerator(fe, src, cfg)
     x, f0 = gen.batch(np.random.default_rng(0), 4)
     assert x.shape[0] == 4 and x.shape[2] == 128 and f0.shape == x.shape[:2]
 

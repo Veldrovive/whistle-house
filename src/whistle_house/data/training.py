@@ -1,52 +1,151 @@
 """Training example generation for frame-level whistle detectors (numpy only, no torch).
 
-An example is ``(features (T, F), f0 (T,))`` where features are the *pipeline front-end output*
+An example is ``(features (T, F), f0 (T,))``: features are the *pipeline front-end output*
 (transform + filters, exactly what the detector sees live) and f0 is the target pitch in Hz per
 frame (0 = no whistle).
 
-Pitch labels for real whistle recordings are produced automatically by running the heuristic
-``peak_tracker`` on the clean (quiet-room) recording - in clean conditions it is accurate. If a
-recording has ``segments``, labels are restricted to its ``whistle`` segments. The labels are
-then kept while noise/speech is mixed in, which is what teaches the model to ignore it.
+Data sources (``collect_sources`` gathers them into a picklable ``TrainingSources``):
+
+* mic recordings (``data/recordings``): ``whistle`` clips are positives, ``speech``/``noise``/
+  ``music``/``silence`` clips are interferers;
+* external datasets (``$WHISTLE_HOUSE_EXTERNAL/prepared/*``): ``whistle`` clips are positives,
+  ``hum``/``speech``/``music``/``noise`` are interferers;
+* ``data/noise/**``: extra interferer audio;
+* synthetic whistles and synthetic pseudo-speech.
+
+Pitch labels for positives are produced by running the heuristic ``peak_tracker`` on the clean
+clip. They are computed once per front-end and cached (``LabelCache``) as 100 Hz f0 tracks.
+External clips whose labels cover too little of the clip (noisy/failed tracking) are dropped.
+
+Each example: pick a clean source by the mix probabilities (``GeneratorConfig``), mix in a
+random interferer at a random SNR, randomise gain/EQ/reverb, run the front-end, and sample the
+f0 labels at the frame times.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import multiprocessing as mp
+from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
+from whistle_house.audio.io import resample, to_mono_float
 from whistle_house.data.augment import (
-    NoiseBank,
+    AUDIO_EXTS,
+    fit_length,
     mix_at_snr,
     random_eq,
     random_gain,
     random_reverb,
     rms,
+    synth_pseudo_speech,
     synth_whistle,
 )
-from whistle_house.data.store import NEGATIVE_LABELS, Recording, RecordingStore
+from whistle_house.data.store import NEGATIVE_LABELS, RecordingStore
 from whistle_house.pipeline import Frontend
 from whistle_house.stages.base import StageContext, build_stage
 from whistle_house.types import WhistleEvent
 
 log = logging.getLogger(__name__)
 
+LABEL_RATE = 100  # Hz, resolution of cached f0 tracks
+
+
+def _mp_context():
+    """forkserver: forking a process that already runs threads (torch, BLAS) can deadlock."""
+    return mp.get_context("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn")
+
+
+# --------------------------------------------------------------------------- config
+
 
 @dataclass
 class GeneratorConfig:
     window_s: float = 3.0
     warmup_s: float = 1.0  # discarded lead-in so stateful filters (noise floor) are settled
-    p_real_whistle: float = 0.45
-    p_synth_whistle: float = 0.25  # remainder: negative-only examples
+    # Probability that an example's clean signal is a whistle from each source; the remainder
+    # is "no whistle". Unavailable sources hand their share to synthetic whistles.
+    p_mic_whistle: float = 0.45
+    p_ext_whistle: float = 0.0
+    p_synth_whistle: float = 0.25
+    # Relative weights when picking an interferer group (missing groups are skipped).
+    interferer_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "mic": 3.0,  # negatives recorded on the deployment mic: most valuable
+            "speech": 3.0,
+            "hum": 2.0,
+            "noise": 2.0,
+            "music": 1.0,
+            "noise_dir": 1.0,
+            "synthetic": 1.0,
+        }
+    )
     p_interferer: float = 0.85
     snr_db: tuple[float, float] = (-3.0, 25.0)
     p_reverb: float = 0.3
     p_eq: float = 0.5
-    # peak_tracker params used to auto-label clean whistle recordings
-    labeler_params: dict = field(default_factory=dict)
+    # Drop external positives whose auto-labels cover less of the clip (failed/noisy tracking).
+    min_voiced_fraction: float = 0.2
+    # peak_tracker params for auto-labelling. Stricter than live detection: on synthetic tests
+    # this cut labels on white noise 29% -> 10% and on pseudo-speech 45% -> 5% while keeping
+    # 99% whistle recall and raising pitch accuracy 86% -> 97%.
+    labeler_params: dict = field(
+        default_factory=lambda: {"min_prominence": 25.0, "min_duration_s": 0.15}
+    )
+
+
+MIX_PRESETS: dict[str, dict] = {
+    # only this mic + synthetic (no external data needed)
+    "mic": {"p_mic_whistle": 0.45, "p_ext_whistle": 0.0, "p_synth_whistle": 0.25},
+    # warm start: external + synthetic; mic data not required
+    "pretrain": {"p_mic_whistle": 0.0, "p_ext_whistle": 0.5, "p_synth_whistle": 0.2},
+    # adapt a pretrained model to the deployment mic, keeping some external data in the mix
+    "finetune": {"p_mic_whistle": 0.45, "p_ext_whistle": 0.15, "p_synth_whistle": 0.1},
+}
+
+
+def config_for_mix(mix: str, **overrides) -> GeneratorConfig:
+    if mix not in MIX_PRESETS:
+        raise KeyError(f"unknown mix {mix!r}; choose from {list(MIX_PRESETS)}")
+    return GeneratorConfig(**{**MIX_PRESETS[mix], **overrides})
+
+
+# --------------------------------------------------------------------------- sources
+
+
+@dataclass
+class PositiveClip:
+    key: str
+    path: str
+    f0: np.ndarray  # float16 f0 track at LABEL_RATE (0 = none)
+
+
+@dataclass
+class TrainingSources:
+    """Everything a generator needs, picklable for DataLoader workers."""
+
+    mic_positives: list[PositiveClip] = field(default_factory=list)
+    ext_positives: list[PositiveClip] = field(default_factory=list)
+    interferers: dict[str, list[str]] = field(default_factory=dict)  # group -> file paths
+
+    def summary(self) -> dict:
+        return {
+            "mic_whistle_clips": len(self.mic_positives),
+            "external_whistle_clips": len(self.ext_positives),
+            **{f"interferers_{k}": len(v) for k, v in self.interferers.items()},
+        }
+
+
+def frontend_hash(frontend_spec: dict, labeler_params: dict) -> str:
+    blob = json.dumps({"f": frontend_spec, "l": labeler_params}, sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
 def events_to_f0(events: list[WhistleEvent], n_samples: int, sr: int) -> np.ndarray:
@@ -61,78 +160,256 @@ def events_to_f0(events: list[WhistleEvent], n_samples: int, sr: int) -> np.ndar
     return f0
 
 
+def auto_label(audio: np.ndarray, sr: int, frontend_spec: dict, labeler_params: dict) -> np.ndarray:
+    """Clean audio -> f0 track at LABEL_RATE via the frontend + peak_tracker."""
+    fe = Frontend.from_dict(frontend_spec)
+    if sr != fe.sample_rate:
+        audio = resample(audio, sr, fe.sample_rate)
+        sr = fe.sample_rate
+    _, filt = fe.process_signal(audio)
+    det = build_stage("detector", "peak_tracker", labeler_params, StageContext(sr, axis=fe.axis))
+    events = det.process(filt).events + det.flush()
+    n = int(len(audio) / sr * LABEL_RATE) + 1
+    return events_to_f0(events, n, LABEL_RATE).astype(np.float16)
+
+
+def _label_job(args) -> tuple[str, np.ndarray]:
+    key, path, segments, frontend_spec, labeler_params = args
+    audio, sr = sf.read(path, dtype="float32", always_2d=False)
+    f0 = auto_label(to_mono_float(audio), sr, frontend_spec, labeler_params)
+    if segments:  # restrict to annotated whistle segments
+        mask = np.zeros(len(f0), bool)
+        for s, e in segments:
+            mask[int(s * LABEL_RATE) : int(e * LABEL_RATE) + 1] = True
+        f0[~mask] = 0
+    return key, f0
+
+
+class LabelCache:
+    """f0 tracks per clip key, one .npz per (namespace, frontend+labeler hash)."""
+
+    def __init__(self, directory: Path, namespace: str, fhash: str):
+        self.path = directory / f"{namespace}-{fhash}.npz"
+        self.labels: dict[str, np.ndarray] = {}
+        if self.path.exists():
+            with np.load(self.path) as z:
+                self.labels = {k: z[k] for k in z.files}
+
+    def ensure(
+        self,
+        items: list[tuple[str, str, list[tuple[float, float]]]],
+        frontend_spec: dict,
+        labeler_params: dict,
+        workers: int = 4,
+    ) -> dict[str, np.ndarray]:
+        """Compute labels for (key, path, segments) items not yet cached."""
+        todo = [i for i in items if i[0] not in self.labels]
+        if todo:
+            log.info("auto-labelling %d clips -> %s", len(todo), self.path.name)
+            jobs = [(k, p, s, frontend_spec, labeler_params) for k, p, s in todo]
+            if workers > 1:
+                with ProcessPoolExecutor(workers, mp_context=_mp_context()) as pool:
+                    for n, (k, f0) in enumerate(pool.map(_label_job, jobs, chunksize=4)):
+                        self.labels[k] = f0
+                        if (n + 1) % 200 == 0:
+                            log.info("  labelled %d/%d", n + 1, len(jobs))
+            else:
+                for k, f0 in map(_label_job, jobs):
+                    self.labels[k] = f0
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp.npz")
+            np.savez(tmp, **self.labels)
+            tmp.replace(self.path)
+        return {k: self.labels[k] for k, _, _ in items}
+
+
+def collect_sources(
+    frontend_spec: dict,
+    splits: tuple[str, ...],
+    store: RecordingStore | None = None,
+    label_cache_dir: Path | None = None,
+    external_root: Path | None = None,
+    external_datasets: list[str] | None = None,
+    noise_dirs: list[Path] | None = None,
+    config: GeneratorConfig | None = None,
+    workers: int = 4,
+) -> TrainingSources:
+    """Gather + auto-label every source for the given splits."""
+    from whistle_house.external.base import POSITIVE_LABELS, get_dataset, load_manifest
+
+    cfg = config or GeneratorConfig()
+    fh = frontend_hash(frontend_spec, cfg.labeler_params)
+    src = TrainingSources()
+
+    if store is not None:
+        pos_items, mic_neg = [], []
+        for rec in store.list():
+            if rec.split not in splits:
+                continue
+            path = str(store.audio_path(rec.id))
+            if rec.label == "whistle":
+                segs = [(s.start, s.end) for s in rec.segments if s.label == "whistle"]
+                key = rec.id + (
+                    ":" + hashlib.sha1(repr(segs).encode()).hexdigest()[:8] if segs else ""
+                )
+                pos_items.append((key, path, segs))
+            elif rec.label in NEGATIVE_LABELS:
+                mic_neg.append(path)
+        if pos_items:
+            cache = LabelCache(label_cache_dir or Path("."), "mic", fh)
+            labels = cache.ensure(pos_items, frontend_spec, cfg.labeler_params, workers)
+            src.mic_positives = [PositiveClip(k, p, labels[k]) for k, p, _ in pos_items]
+        if mic_neg:
+            src.interferers["mic"] = mic_neg
+
+    if external_root is not None:
+        for name in external_datasets or []:
+            ds = get_dataset(name, external_root)
+            if not ds.is_prepared():
+                raise RuntimeError(
+                    f"external dataset {name} is not prepared; run `whistle-house datasets fetch {name}`"
+                )
+            entries = [e for e in load_manifest(ds.prepared_dir) if e.split in splits]
+            pos = [e for e in entries if e.label in POSITIVE_LABELS]
+            if pos:
+                items = [(f"{name}/{e.path}", str(ds.prepared_dir / e.path), []) for e in pos]
+                cache = LabelCache(external_root / "labels", name, fh)
+                labels = cache.ensure(items, frontend_spec, cfg.labeler_params, workers)
+                kept = [
+                    PositiveClip(k, p, labels[k])
+                    for k, p, _ in items
+                    if float(np.mean(labels[k] > 0)) >= cfg.min_voiced_fraction
+                ]
+                log.info("%s: kept %d/%d whistle clips after label QA", name, len(kept), len(items))
+                src.ext_positives += kept
+            for e in entries:
+                if e.label not in POSITIVE_LABELS:
+                    src.interferers.setdefault(e.label, []).append(str(ds.prepared_dir / e.path))
+
+    files = [
+        str(p)
+        for d in noise_dirs or []
+        if d.exists()
+        for p in sorted(d.rglob("*"))
+        if p.suffix.lower() in AUDIO_EXTS
+    ]
+    if files:
+        src.interferers["noise_dir"] = files
+    return src
+
+
+# --------------------------------------------------------------------------- audio access
+
+
+def read_segment(path: str, n: int, sr: int, rng: np.random.Generator) -> np.ndarray:
+    """Random n-sample segment of a file at sample rate sr (reads only what it needs)."""
+    info = sf.info(path)
+    n_in = int(np.ceil(n * info.samplerate / sr)) + 16
+    start = int(rng.integers(0, max(1, info.frames - n_in + 1)))
+    data, _ = sf.read(path, frames=n_in, start=start, dtype="float32", always_2d=False)
+    x = resample(to_mono_float(data), info.samplerate, sr)
+    return fit_length(x, n, rng)
+
+
+class _ClipCache:
+    def __init__(self, sr: int, size: int = 64):
+        self.sr, self.size = sr, size
+        self._d: OrderedDict[str, np.ndarray] = OrderedDict()
+
+    def get(self, path: str) -> np.ndarray:
+        if path in self._d:
+            self._d.move_to_end(path)
+            return self._d[path]
+        data, sr = sf.read(path, dtype="float32", always_2d=False)
+        x = resample(to_mono_float(data), sr, self.sr)
+        self._d[path] = x
+        if len(self._d) > self.size:
+            self._d.popitem(last=False)
+        return x
+
+
+# --------------------------------------------------------------------------- generator
+
+
 class ExampleGenerator:
     def __init__(
         self,
         frontend_spec: dict,
-        store: RecordingStore | None,
-        noise_dirs: list[Path],
-        splits: tuple[str, ...] = ("train",),
+        sources: TrainingSources,
         config: GeneratorConfig | None = None,
-        data_dir: Path | None = None,
     ):
         self.cfg = config or GeneratorConfig()
-        self.frontend_spec = frontend_spec
-        self.frontend = Frontend.from_dict(frontend_spec, data_dir)
+        self.frontend = Frontend.from_dict(frontend_spec)
         self.sr = self.frontend.sample_rate
-        self.positives: list[tuple[np.ndarray, np.ndarray]] = []
-        neg_files: list[Path] = []
-        if store is not None:
-            for rec in store.list():
-                if rec.split not in splits:
-                    continue
-                if rec.label == "whistle":
-                    audio, _ = store.load(rec.id, self.sr)
-                    self.positives.append((audio, self._auto_label(rec, audio)))
-                elif rec.label in NEGATIVE_LABELS:
-                    neg_files.append(store.audio_path(rec.id))
-        self.noise = NoiseBank(self.sr, neg_files + NoiseBank.scan(noise_dirs))
-        log.info(
-            "generator: %d whistle recordings, %d interferer files",
-            len(self.positives),
-            len(self.noise.files),
-        )
-
-    def _auto_label(self, rec: Recording, audio: np.ndarray) -> np.ndarray:
-        self.frontend.reset()
-        _, filt = self.frontend.push(audio)
-        det = build_stage(
-            "detector",
-            "peak_tracker",
-            self.cfg.labeler_params,
-            StageContext(self.sr, axis=self.frontend.axis),
-        )
-        events = det.process(filt).events + det.flush()
-        f0 = events_to_f0(events, len(audio), self.sr)
-        segs = [s for s in rec.segments if s.label == "whistle"]
-        if segs:
-            mask = np.zeros(len(audio), bool)
-            for s in segs:
-                mask[int(s.start * self.sr) : int(s.end * self.sr)] = True
-            f0[~mask] = 0
-        return f0
+        self.sources = sources
+        self._clips = _ClipCache(self.sr)
+        groups = [
+            (g, w)
+            for g, w in self.cfg.interferer_weights.items()
+            if w > 0 and (g == "synthetic" or sources.interferers.get(g))
+        ]
+        self._groups = [g for g, _ in groups]
+        w = np.array([w for _, w in groups], np.float64)
+        self._group_p = w / w.sum() if len(w) else w
 
     @property
     def axis(self):
         return self.frontend.axis
 
+    def _positive(self, clip: PositiveClip, n: int, rng) -> tuple[np.ndarray, np.ndarray]:
+        audio = self._clips.get(clip.path)
+        f0_full = clip.f0.astype(np.float32)
+        # Pick a window, preferring ones that contain whistling.
+        L = len(audio)
+        off = 0
+        for _ in range(4):
+            off = int(rng.integers(-n // 4, max(1, L - n + n // 4)))
+            lo = max(0, off) * LABEL_RATE // self.sr
+            hi = max(0, off + n) * LABEL_RATE // self.sr
+            if np.any(f0_full[lo:hi] > 0):
+                break
+        clean = np.zeros(n, np.float32)
+        s0, d0 = max(off, 0), max(-off, 0)
+        seg = audio[s0 : s0 + n - d0]
+        clean[d0 : d0 + len(seg)] = seg
+        t = (np.arange(n) + off) / self.sr
+        idx = np.clip((t * LABEL_RATE).astype(int), 0, len(f0_full) - 1)
+        f0 = np.where((t >= 0) & (t < L / self.sr), f0_full[idx], 0).astype(np.float32)
+        return clean, f0
+
+    def _interferer(self, n: int, rng) -> np.ndarray:
+        if not self._groups:
+            return synth_pseudo_speech(self.sr, n / self.sr, rng)
+        g = self._groups[int(rng.choice(len(self._groups), p=self._group_p))]
+        if g == "synthetic":
+            return synth_pseudo_speech(self.sr, n / self.sr, rng)
+        files = self.sources.interferers[g]
+        for _ in range(3):
+            try:
+                x = read_segment(files[int(rng.integers(len(files)))], n, self.sr, rng)
+            except Exception as e:  # noqa: BLE001 - one bad file must not stop training
+                log.warning("bad interferer file: %s", e)
+                continue
+            if rms(x) > 1e-5:
+                return x
+        return synth_pseudo_speech(self.sr, n / self.sr, rng)
+
     def example(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-        c, sr = self.cfg, self.sr
+        c, sr, s = self.cfg, self.sr, self.sources
         n = int((c.window_s + c.warmup_s) * sr)
+        p_mic = c.p_mic_whistle if s.mic_positives else 0.0
+        p_ext = c.p_ext_whistle if s.ext_positives else 0.0
+        p_syn = c.p_synth_whistle + (c.p_mic_whistle - p_mic) + (c.p_ext_whistle - p_ext)
         u = rng.random()
-        p_real = c.p_real_whistle if self.positives else 0.0
-        p_synth = c.p_synth_whistle + (c.p_real_whistle - p_real)
-        if u < p_real:
-            audio, f0_full = self.positives[int(rng.integers(len(self.positives)))]
-            if len(audio) <= n:
-                off = -int(rng.integers(0, n - len(audio) + 1))
-            else:
-                off = int(rng.integers(0, len(audio) - n + 1))
-            clean, f0 = np.zeros(n, np.float32), np.zeros(n, np.float32)
-            src = slice(max(off, 0), max(off, 0) + n)
-            dst = slice(max(-off, 0), max(-off, 0) + len(audio[src]))
-            clean[dst], f0[dst] = audio[src], f0_full[src]
-        elif u < p_real + p_synth:
+        if u < p_mic:
+            clean, f0 = self._positive(
+                s.mic_positives[int(rng.integers(len(s.mic_positives)))], n, rng
+            )
+        elif u < p_mic + p_ext:
+            clean, f0 = self._positive(
+                s.ext_positives[int(rng.integers(len(s.ext_positives)))], n, rng
+            )
+        elif u < p_mic + p_ext + p_syn:
             sw = synth_whistle(sr, c.window_s + c.warmup_s, rng)
             clean, f0 = sw.audio, sw.f0
         else:
@@ -142,15 +419,14 @@ class ExampleGenerator:
             clean = random_reverb(clean, sr, rng)
         has_signal = rms(clean) > 1e-4
         if rng.random() < c.p_interferer or not has_signal:
-            noise = random_gain(self.noise.sample(n, rng), rng, -30, 0)
+            noise = random_gain(self._interferer(n, rng), rng, -30, 0)
             mix = mix_at_snr(clean, noise, rng.uniform(*c.snr_db)) if has_signal else noise
         else:
             mix = clean
         mix = mix + 10 ** rng.uniform(-5, -3) * rng.standard_normal(n).astype(np.float32)
         if rng.random() < c.p_eq:
             mix = random_eq(mix, sr, rng)
-        mix = random_gain(mix, rng, -12, 6)
-        mix = np.clip(mix, -1, 1).astype(np.float32)
+        mix = np.clip(random_gain(mix, rng, -12, 6), -1, 1).astype(np.float32)
 
         _, block = self.frontend.process_signal(mix)
         keep = block.times >= c.warmup_s
@@ -168,6 +444,3 @@ def f0_to_bins(f0: np.ndarray, freqs: np.ndarray) -> np.ndarray:
     b = np.interp(f0, freqs, np.arange(len(freqs)), left=np.nan, right=np.nan)
     b[f0 <= 0] = np.nan
     return b
-
-
-__all__ = ["ExampleGenerator", "GeneratorConfig", "events_to_f0", "f0_to_bins"]

@@ -12,6 +12,9 @@ wheels/
 # Runtime data (recordings, models, tunes, outputs) - lives outside git
 /data/
 
+# Local settings (dataset locations etc.) - see .env.example
+.env
+
 # Manager (vite) build artefacts
 manager/node_modules/
 manager/dist/

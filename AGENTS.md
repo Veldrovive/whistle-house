@@ -40,9 +40,9 @@ mise.toml            node version for the manager (managed by mise)
 src/whistle_house/
   types.py           FrequencyAxis, FrameBlock, WhistleEvent, DetectorOutput, TuneMatch
   pipeline.py        PipelineSpec / Frontend / Pipeline / PipelineStore
-  settings.py        data-dir layout (WHISTLE_HOUSE_DATA, default ./data)
+  settings.py        .env loading; data dir (WHISTLE_HOUSE_DATA) + external root (WHISTLE_HOUSE_EXTERNAL)
   tunes.py           Tune model, TuneLibrary (data/tunes.json), note-template fitting
-  cli.py             `whistle-house` CLI: serve, devices, analyze, import, train-detector
+  cli.py             `whistle-house` CLI: serve, devices, analyze, import, datasets, train-detector, warmstart
   stages/
     base.py          stage ABCs + registry (register, build_stage, list_stages)
     transforms/stft.py   StreamingSTFT core + stft_mel (v1 port) + stft_linear
@@ -54,8 +54,10 @@ src/whistle_house/
   audio/             io.py (load/save/resample), sources.py (MicSource, ReplaySource, ArraySource)
   data/
     store.py         recordings: data/recordings/<id>.wav + <id>.json (label, tune, segments, split)
-    augment.py       mix_at_snr, gain/EQ/reverb, synth_whistle, synth_pseudo_speech, NoiseBank
-    training.py      ExampleGenerator: augmented (features, per-frame f0) examples via the Frontend
+    augment.py       mix_at_snr, gain/EQ/reverb, synth_whistle, synth_pseudo_speech
+    training.py      collect_sources (+ LabelCache pitch auto-labels), ExampleGenerator, MIX_PRESETS
+  external/          external datasets: base.py (download/prepare/manifest framework),
+                     datasets.py (mlend_whistles, mlend_hums, musan, esc50, demand)
   ml/                model.py (WhistleNet, causal CNN), train.py (training loop, status json)
   outputs/           output types (log, webhook, home_assistant_event) + OutputStore (data/outputs.json)
   server/            app.py (FastAPI /api + /ws/live, serves manager/dist), engine.py (LiveEngine)
@@ -63,7 +65,8 @@ manager/             Vite + React + TS manager website
   src/api.ts         typed client — mirror of server/app.py routes
   src/pages/         Live, Data, Tunes, Pipelines, Models, Outputs
   src/components/    Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView, RecordPanel
-tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, server API
+tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, external data, server API
+.env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines)
 ```
 
@@ -82,6 +85,9 @@ uv run whistle-house devices
 uv run whistle-house analyze clip.wav --pipeline default
 uv run whistle-house import *.wav --label speech       # bulk-add to the dataset
 uv run whistle-house train-detector --name whistlenet --device auto
+uv run whistle-house datasets list             # external datasets + status
+uv run whistle-house datasets fetch all        # training machine only (refuses on a Pi)
+uv run whistle-house warmstart                 # fetch -> pretrain -> fine-tune (see below)
 
 # manager (node via mise: `mise install` once; prefix with `mise exec --` if mise isn't activated)
 cd manager && npm install
@@ -105,7 +111,7 @@ npm run lint
    output (trained checkpoints depend on the frontend). Add a new name or a new config field
    whose default keeps the old behaviour. `tests/test_transform.py` pins `stft_mel` to v1.
 4. **Training runs on another machine** (clone the repo, copy `data/`). The Pi only runs
-   inference. Don't spend effort making training fast on the Pi. Inference cost on the Pi does
+   inference and must never store external datasets (`datasets fetch` refuses on a Pi). Don't spend effort making training fast on the Pi. Inference cost on the Pi does
    matter: a pipeline using the `learned` detector should use `chunk_size` ≈ 4096.
 5. **Data is precious.** `data/` is gitignored and holds hand-collected recordings. Never delete
    or rewrite recordings or `data/` contents without asking. Recording splits are deterministic
@@ -125,14 +131,37 @@ npm run lint
   random SNR (−3…25 dB), plus random gain, EQ and reverb. Interferers come from negative
   recordings on this mic, files in `data/noise/**`, and `synth_pseudo_speech` (harmonic stacks
   with moving formants, the spectral shape that fooled v1).
-* **External corpora worth dropping into `data/noise/`** (check licences): MUSAN (speech / music /
-  noise), ESC-50 (environmental sounds), DEMAND (domestic noise), LibriSpeech or Common Voice
-  (speech). Whistle-specific public data is scarce. The MLEnd "Hums and Whistles" dataset may
-  be usable for extra positives. Synthetic whistles (`synth_whistle`) fill the gap meanwhile.
+* **External datasets** (`external/`, see the workflow below) give a warm start: MLEnd whistles
+  (positives), MLEnd hums (hard negatives), MUSAN speech/music/noise, ESC-50, DEMAND. Any other
+  audio dropped into `data/noise/` is used as extra interferers. Synthetic whistles fill gaps.
+* **Auto-labelling** uses stricter `peak_tracker` params than live detection
+  (`GeneratorConfig.labeler_params`), and external whistle clips with <20% labelled frames are
+  dropped. Labels are cached per front-end in `data/cache/labels/` and `<external>/labels/`.
+* **Mix presets** (`MIX_PRESETS`): `mic` (mic + synthetic), `pretrain` (external +
+  synthetic), `finetune` (mic-heavy + some external, use with `--init-from`).
 * Model: `WhistleNet`, a small causal dilated CNN (about 7k params) over frontend frames. It
   outputs per-frame presence (whistle or not) and a pitch-salience map. It is causal, so
   streaming == offline. Metrics written per epoch to `data/models/<name>.json`, notably
   `false_positive_rate` (the speech-rejection number to drive down).
+
+## Training-machine workflow (warm start)
+
+```bash
+git clone <repo> && cd whistle-house && uv sync --extra ml
+cp .env.example .env            # set WHISTLE_HOUSE_EXTERNAL=/big/disk/whistle-datasets
+rsync -a pi:projects/whistle-house/data/ ./data/   # mic recordings, pipelines, tunes
+uv run whistle-house datasets fetch all --clean-raw   # ~17 GB MLEnd + 11 GB MUSAN + ~1.3 GB
+uv run whistle-house warmstart --skip-fetch --workers 8
+#   = train-detector --mix pretrain --external all --name whistlenet-pretrain
+#   + train-detector --mix finetune --external all --init-from whistlenet-pretrain --name whistlenet
+#     (fine-tune is skipped if data/ has no mic whistle recordings yet)
+rsync -a data/models/whistlenet.* pi:projects/whistle-house/data/models/
+```
+
+Then on the Pi make a pipeline with the `learned` detector (`checkpoint: whistlenet.pt`,
+`chunk_size` 4096, same transform/filters as the training pipeline). Re-run only the fine-tune
+step as more mic data is collected. To add a dataset: subclass `ExternalDataset` in
+`external/datasets.py` (`download`, `iter_sources`) and decorate with `@register_dataset`.
 
 ## Roadmap (next steps)
 

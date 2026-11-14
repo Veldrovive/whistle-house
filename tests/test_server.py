@@ -60,3 +60,12 @@ def test_api_roundtrip(tmp_path):
 
         # recording without a mic is a clean 409
         assert c.post("/api/record/start", json={}).status_code == 409
+
+
+def test_datasets_endpoint(tmp_path, monkeypatch):
+    monkeypatch.delenv("WHISTLE_HOUSE_EXTERNAL", raising=False)
+    with TestClient(create_app(Paths(tmp_path), live=False)) as c:
+        info = c.get("/api/datasets").json()
+        assert info["root"] is None
+        assert {d["name"] for d in info["datasets"]} >= {"mlend_whistles", "musan", "esc50"}
+        assert set(info["mixes"]) == {"mic", "pretrain", "finetune"}

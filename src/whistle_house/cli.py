@@ -65,22 +65,167 @@ def cmd_import(args) -> None:
         print(f"{rec.id}  {rec.label}  {rec.duration:.1f}s  <- {f}")
 
 
+def _external_list(value: str | None) -> list[str]:
+    """'all' -> every prepared dataset; 'a,b' -> [a, b]; None/'' -> []."""
+    from whistle_house.external import dataset_status
+    from whistle_house.settings import external_root
+
+    if not value:
+        return []
+    if value == "all":
+        return [d["name"] for d in dataset_status(external_root()) if d["prepared"]]
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _train_config(args, **overrides):
+    from whistle_house.ml.train import TrainConfig
+
+    return TrainConfig(
+        **{
+            "epochs": args.epochs,
+            "steps_per_epoch": args.steps_per_epoch,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "seed": args.seed,
+            "device": args.device,
+            "workers": args.workers,
+            **overrides,
+        }
+    )
+
+
 def cmd_train(args) -> None:
-    from whistle_house.ml.train import TrainConfig, train
+    from whistle_house.ml.train import train
     from whistle_house.pipeline import PipelineStore
 
     paths = _paths(args)
     spec = PipelineStore(paths.pipelines).get(args.pipeline)
-    cfg = TrainConfig(
-        epochs=args.epochs,
-        steps_per_epoch=args.steps_per_epoch,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-        device=args.device,
+    cfg = _train_config(
+        args, mix=args.mix, external=_external_list(args.external), init_from=args.init_from
     )
     path = train(spec, paths, args.name, cfg)
     print(f"saved {path}")
+
+
+def cmd_datasets_list(args) -> None:
+    from whistle_house.external import dataset_status
+    from whistle_house.settings import external_root
+
+    root = external_root(required=False)
+    print(f"external root: {root or '(WHISTLE_HOUSE_EXTERNAL not set)'}\n")
+    for d in dataset_status(root):
+        state = "prepared" if d["prepared"] else "downloaded" if d["downloaded"] else "-"
+        print(f"{d['name']:16s} {state:10s} {d['download_size']:>40s}  {d['description']}")
+        if d["stats"]:
+            print(
+                " " * 28
+                + ", ".join(
+                    f"{k}: {v['clips']} clips / {v['hours']} h" for k, v in d["stats"].items()
+                )
+            )
+        print(" " * 28 + f"licence: {d['license']}")
+
+
+def _fetch(names: list[str], clean_raw: bool, allow_pi: bool, workers: int) -> None:
+    from whistle_house.external import dataset_names, get_dataset
+    from whistle_house.settings import external_root, is_raspberry_pi
+
+    if is_raspberry_pi() and not allow_pi:
+        raise SystemExit(
+            "Refusing to fetch datasets on a Raspberry Pi (they are tens of GB). Run this on the "
+            "training machine, or pass --allow-pi if you really mean it."
+        )
+    root = external_root()
+    if names == ["all"]:
+        names = dataset_names()
+    for name in names:
+        ds = get_dataset(name, root)
+        print(f"== {name}: {ds.description}\n   licence: {ds.license}")
+        if ds.is_prepared():
+            print("   already prepared (delete its prepared/ dir to redo)")
+            continue
+        ds.download()
+        print("   preparing ...")
+        ds.prepare(workers=workers)
+        if clean_raw:
+            ds.clean_raw()
+
+
+def cmd_datasets_fetch(args) -> None:
+    _fetch(args.names, args.clean_raw, args.allow_pi, args.workers)
+
+
+def cmd_datasets_labels(args) -> None:
+    """Pre-compute pitch auto-labels (otherwise done at the start of training)."""
+    from whistle_house.data.store import RecordingStore
+    from whistle_house.data.training import collect_sources
+    from whistle_house.pipeline import PipelineStore
+    from whistle_house.settings import external_root
+
+    paths = _paths(args)
+    spec = PipelineStore(paths.pipelines).get(args.pipeline)
+    ext = _external_list(args.external)
+    src = collect_sources(
+        spec.frontend_dict(),
+        ("train", "val", "test"),
+        store=RecordingStore(paths.recordings),
+        label_cache_dir=paths.label_cache,
+        external_root=external_root(required=bool(ext)),
+        external_datasets=ext,
+        noise_dirs=[paths.noise],
+        workers=args.workers,
+    )
+    print(src.summary())
+
+
+def cmd_warmstart(args) -> None:
+    """fetch external datasets -> pretrain on them -> fine-tune on this mic's recordings."""
+    import shutil
+
+    from whistle_house.data.store import RecordingStore
+    from whistle_house.ml.train import train
+    from whistle_house.pipeline import PipelineStore
+
+    paths = _paths(args)
+    if not args.skip_fetch:
+        _fetch(args.datasets.split(","), args.clean_raw, args.allow_pi, args.workers)
+    spec = PipelineStore(paths.pipelines).get(args.pipeline)
+    ext = _external_list(args.datasets if args.datasets != "all" else "all")
+
+    pre_name = f"{args.name}-pretrain"
+    print(f"\n== pretraining {pre_name} on {ext} + synthetic ({args.pretrain_epochs} epochs)")
+    train(
+        spec,
+        paths,
+        pre_name,
+        _train_config(args, mix="pretrain", external=ext, epochs=args.pretrain_epochs),
+    )
+
+    has_mic = any(r.label == "whistle" for r in RecordingStore(paths.recordings).list())
+    if not has_mic:
+        shutil.copy(paths.models / f"{pre_name}.pt", paths.models / f"{args.name}.pt")
+        print(
+            f"\nNo mic whistle recordings in {paths.recordings}: skipped fine-tuning, saved the "
+            f"pretrained model as {args.name}.pt. Collect data on the Pi, copy data/ here and run "
+            f"`whistle-house train-detector --mix finetune --init-from {pre_name} "
+            f"--external all --name {args.name}`."
+        )
+        return
+    print(f"\n== fine-tuning {args.name} on mic recordings ({args.finetune_epochs} epochs)")
+    train(
+        spec,
+        paths,
+        args.name,
+        _train_config(
+            args,
+            mix="finetune",
+            external=ext,
+            init_from=pre_name,
+            epochs=args.finetune_epochs,
+            lr=args.lr / 4,
+        ),
+    )
+    print(f"\nDone: {paths.models / args.name}.pt (+ .json). Copy both to the Pi's data/models/.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -111,16 +256,49 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tune", help="tune id (for tune examples)")
     p.set_defaults(fn=cmd_import)
 
+    def train_args(p, epochs=20, steps=100, batch=16):
+        p.add_argument("--pipeline", default="default", help="pipeline whose front-end to train on")
+        p.add_argument("--name", default="whistlenet")
+        p.add_argument("--epochs", type=int, default=epochs)
+        p.add_argument("--steps-per-epoch", type=int, default=steps)
+        p.add_argument("--batch-size", type=int, default=batch)
+        p.add_argument("--lr", type=float, default=2e-3)
+        p.add_argument("--seed", type=int, default=0)
+        p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
+        p.add_argument("--workers", type=int, default=4, help="example-generation processes")
+
     p = sub.add_parser("train-detector", help="train the learned whistle detector (needs ml extra)")
-    p.add_argument("--pipeline", default="default", help="pipeline whose front-end to train on")
-    p.add_argument("--name", default="whistlenet")
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--steps-per-epoch", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=2e-3)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
+    train_args(p)
+    p.add_argument("--mix", default="mic", help="data mix preset: mic | pretrain | finetune")
+    p.add_argument("--external", help="external datasets to use: 'all' or comma list")
+    p.add_argument("--init-from", help="checkpoint (path or model name) to fine-tune from")
     p.set_defaults(fn=cmd_train)
+
+    p = sub.add_parser("datasets", help="external datasets (training machine only)")
+    dsub = p.add_subparsers(dest="dcmd", required=True)
+    q = dsub.add_parser("list", help="show datasets and their status")
+    q.set_defaults(fn=cmd_datasets_list)
+    q = dsub.add_parser("fetch", help="download + prepare datasets into $WHISTLE_HOUSE_EXTERNAL")
+    q.add_argument("names", nargs="+", help="dataset names, or 'all'")
+    q.add_argument("--clean-raw", action="store_true", help="delete raw downloads after prepare")
+    q.add_argument("--allow-pi", action="store_true", help="allow running on a Raspberry Pi")
+    q.add_argument("--workers", type=int, default=8)
+    q.set_defaults(fn=cmd_datasets_fetch)
+    q = dsub.add_parser("labels", help="pre-compute pitch auto-labels for a pipeline's front-end")
+    q.add_argument("--pipeline", default="default")
+    q.add_argument("--external", default="all")
+    q.add_argument("--workers", type=int, default=8)
+    q.set_defaults(fn=cmd_datasets_labels)
+
+    p = sub.add_parser("warmstart", help="fetch datasets, pretrain on them, fine-tune on mic data")
+    train_args(p, epochs=0, steps=500, batch=32)
+    p.add_argument("--datasets", default="all", help="'all' or comma list of dataset names")
+    p.add_argument("--skip-fetch", action="store_true", help="datasets are already prepared")
+    p.add_argument("--clean-raw", action="store_true")
+    p.add_argument("--allow-pi", action="store_true")
+    p.add_argument("--pretrain-epochs", type=int, default=40)
+    p.add_argument("--finetune-epochs", type=int, default=15)
+    p.set_defaults(fn=cmd_warmstart)
 
     args = ap.parse_args(argv)
     logging.basicConfig(

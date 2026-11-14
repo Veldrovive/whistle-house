@@ -129,12 +129,29 @@ export type ModelStatus = {
   config: Record<string, number | string>
   history: Record<string, number>[]
   best?: Record<string, number>
-  data?: Record<string, number>
+  data?: Record<string, Record<string, number>> // {train: {...counts}, val: {...counts}}
+  init_from?: string
   error?: string
   device?: string
   params?: number
   running: boolean
   has_checkpoint: boolean
+}
+
+export type DatasetStatus = {
+  name: string
+  description: string
+  homepage: string
+  license: string
+  download_size: string
+  downloaded: boolean
+  prepared: boolean
+  stats: Record<string, { clips: number; hours: number }> | null
+}
+export type DatasetsInfo = {
+  root: string | null // WHISTLE_HOUSE_EXTERNAL; usually null on the Pi
+  datasets: DatasetStatus[]
+  mixes: Record<string, Record<string, number>>
 }
 
 export class ApiError extends Error {}
@@ -235,7 +252,12 @@ export const api = {
     epochs: number
     steps_per_epoch: number
     batch_size: number
+    mix: string
+    external: string[]
+    init_from?: string
+    workers: number
   }) => req('POST', '/api/models/train', body),
+  datasets: () => req<DatasetsInfo>('GET', '/api/datasets'),
   stopTraining: (name: string) => req('POST', `/api/models/${name}/stop`),
   modelLog: (name: string) => req<{ log: string }>('GET', `/api/models/${name}/log`),
 }
