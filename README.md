@@ -21,12 +21,14 @@ No mic available (or v1 still holds it)? `uv run whistle-house serve --replay so
 Workflow:
 
 1. **Live**: check the mic and spectrogram. Record clips labelled `whistle`, `speech`, `noise`, …
+   Include 20-30 s of `silence` (nothing happening): it calibrates the noise gate.
 2. **Tunes**: create a tune, record a few examples, press *Fit*, tick the outputs it should fire.
 3. **Outputs**: add a Home Assistant event or webhook.
 4. **Models**: train the learned detector on a GPU box, not the Pi: set `WHISTLE_HOUSE_EXTERNAL`
    in `.env`, copy `data/`, run `uv run whistle-house warmstart` (downloads public datasets,
    pretrains, fine-tunes on your mic data), copy the model back, then switch a pipeline's
    detector to `learned`. Details in AGENTS.md.
-5. **Pipelines**: tweak stages and params, test on recordings, make one active.
+5. **Pipelines**: tweak stages and params, test on recordings, make one active. The mic is noisy:
+   add a `spectral_gate` filter and press *Measure from silence* in its panel.
 
 See [AGENTS.md](AGENTS.md) for architecture, layout, and contribution rules.

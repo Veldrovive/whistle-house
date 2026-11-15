@@ -62,6 +62,34 @@ def test_api_roundtrip(tmp_path):
         assert c.post("/api/record/start", json={}).status_code == 409
 
 
+def test_noise_profile_endpoints(tmp_path):
+    rng = np.random.default_rng(0)
+    with TestClient(create_app(Paths(tmp_path), live=False)) as c:
+        sil = c.post(
+            "/api/recordings/upload",
+            files={"file": ("s.wav", _wav(0.02 * rng.standard_normal(SR * 3)), "audio/wav")},
+            data={"label": "silence"},
+        ).json()
+        spec = c.get("/api/pipelines").json()["pipelines"][0]
+        spec["filters"] = []
+        body = {"name": "room", "recording_ids": [sil["id"]], "spec": spec}
+        prof = c.post("/api/noise-profiles", json=body).json()
+        assert prof["name"] == "room" and len(prof["mean"]) == len(prof["freqs"])
+        assert c.post("/api/noise-profiles", json=body).status_code == 400  # immutable
+        assert [p["name"] for p in c.get("/api/noise-profiles").json()] == ["room"]
+
+        spec["filters"] = [{"name": "spectral_gate", "params": {"profile": "room"}}]
+        assert c.put("/api/pipelines/gated", json=spec).status_code == 200
+        # a filter in front of the gate invalidates the profile
+        bad = {**spec, "filters": [{"name": "frame_median", "params": {}}, *spec["filters"]]}
+        r = c.put("/api/pipelines/bad", json=bad)
+        assert r.status_code == 400 and "rebuild" in r.json()["detail"]
+
+        assert c.delete("/api/noise-profiles/room").status_code == 400  # in use
+        c.delete("/api/pipelines/gated")
+        assert c.delete("/api/noise-profiles/room").json() == {"ok": True}
+
+
 def test_datasets_endpoint(tmp_path, monkeypatch):
     monkeypatch.delenv("WHISTLE_HOUSE_EXTERNAL", raising=False)
     with TestClient(create_app(Paths(tmp_path), live=False)) as c:

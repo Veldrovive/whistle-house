@@ -61,10 +61,16 @@ class _ExampleStream(torch.utils.data.IterableDataset):
     """Endless stream of generated batches; every worker gets its own RNG + generator."""
 
     def __init__(
-        self, frontend: dict, sources: TrainingSources, gcfg: GeneratorConfig, bs: int, seed: int
+        self,
+        frontend: dict,
+        sources: TrainingSources,
+        gcfg: GeneratorConfig,
+        bs: int,
+        seed: int,
+        data_dir: Path | None = None,
     ):
         super().__init__()
-        self.args = (frontend, sources, gcfg)
+        self.args = (frontend, sources, gcfg, data_dir)
         self.bs, self.seed = bs, seed
 
     def __iter__(self):
@@ -162,6 +168,7 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
             "noise_dirs": [paths.noise],
             "config": gcfg,
             "workers": max(1, cfg.workers),
+            "data_dir": paths.root,
         }
         train_src = collect_sources(frontend, ("train",), **common)
         val_src = collect_sources(frontend, ("val",), **common)
@@ -170,9 +177,9 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
         status["data"] = {"train": train_src.summary(), "val": val_src.summary()}
         write_status()
 
-        gen = ExampleGenerator(frontend, train_src, gcfg)
+        gen = ExampleGenerator(frontend, train_src, gcfg, paths.root)
         freqs = gen.axis.freqs
-        vx, vf0 = ExampleGenerator(frontend, val_src, gcfg).batch(
+        vx, vf0 = ExampleGenerator(frontend, val_src, gcfg, paths.root).batch(
             np.random.default_rng(cfg.seed + 1), cfg.val_examples
         )
         vx = vx.astype(np.float32)
@@ -196,7 +203,7 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
         model = model.to(dev)
         model.train()
 
-        stream = _ExampleStream(frontend, train_src, gcfg, cfg.batch_size, cfg.seed)
+        stream = _ExampleStream(frontend, train_src, gcfg, cfg.batch_size, cfg.seed, paths.root)
         loader = torch.utils.data.DataLoader(
             stream,
             batch_size=None,

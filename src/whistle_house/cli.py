@@ -228,6 +228,61 @@ def cmd_warmstart(args) -> None:
     print(f"\nDone: {paths.models / args.name}.pt (+ .json). Copy both to the Pi's data/models/.")
 
 
+def cmd_noise_list(args) -> None:
+    from whistle_house.noise_profiles import NoiseProfileStore
+
+    for p in NoiseProfileStore(_paths(args).noise_profiles).list():
+        _, mu, sd = p.arrays()
+        print(
+            f"{p.name:20s} {p.duration_s:6.1f}s  {p.n_frames} frames ({p.n_dropped} dropped)  "
+            f"noise {mu.min():.0f}..{mu.max():.0f} dB ±{sd.mean():.1f}  "
+            f"after {[f['name'] for f in p.upstream['filters']] or 'transform'}  {p.created}"
+        )
+
+
+def cmd_noise_create(args) -> None:
+    from whistle_house.data.store import RecordingStore
+    from whistle_house.noise_profiles import (
+        NoiseProfileStore,
+        attach_gate,
+        gate_position,
+        profile_from_recordings,
+    )
+    from whistle_house.pipeline import PipelineSpec, PipelineStore
+
+    paths = _paths(args)
+    recs = RecordingStore(paths.recordings)
+    pipes = PipelineStore(paths.pipelines)
+    spec = pipes.get(args.pipeline).model_dump()
+    ids = args.recordings.split(",") if args.recordings else [r.id for r in recs.list("silence")]
+    pos = gate_position(spec) if args.position is None else args.position
+    store = NoiseProfileStore(paths.noise_profiles)
+    try:
+        if store.exists(args.name):
+            raise FileExistsError(f"noise profile {args.name!r} already exists (pick a new name)")
+        prof = profile_from_recordings(args.name, spec, recs, ids, pos, paths.root)
+        store.save(prof)
+    except (ValueError, FileExistsError, FileNotFoundError) as e:
+        raise SystemExit(f"error: {e}") from None
+    print(
+        f"saved {paths.noise_profiles / args.name}.json from {len(ids)} recording(s), "
+        f"{prof.n_frames} frames ({prof.n_dropped} loud frames dropped), measured after "
+        f"{[f['name'] for f in spec['filters'][:pos]] or 'the transform'}"
+    )
+    if args.add:
+        new = PipelineSpec.model_validate(attach_gate(spec, args.name, pos))
+        pipes.put(new)
+        print(f"pipeline {new.name}: filters now {[f.name for f in new.filters]}")
+    else:
+        print(f"use it with a spectral_gate filter at position {pos} (or re-run with --add)")
+
+
+def cmd_noise_delete(args) -> None:
+    from whistle_house.noise_profiles import NoiseProfileStore
+
+    NoiseProfileStore(_paths(args).noise_profiles).delete(args.name)
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whistle-house")
     ap.add_argument("--data", help="data directory (default: $WHISTLE_HOUSE_DATA or ./data)")
@@ -299,6 +354,27 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--pretrain-epochs", type=int, default=40)
     p.add_argument("--finetune-epochs", type=int, default=15)
     p.set_defaults(fn=cmd_warmstart)
+
+    p = sub.add_parser("noise-profile", help="noise profiles for the spectral_gate filter")
+    nsub = p.add_subparsers(dest="ncmd", required=True)
+    q = nsub.add_parser("list", help="show saved noise profiles")
+    q.set_defaults(fn=cmd_noise_list)
+    q = nsub.add_parser("create", help="measure a noise profile from silence recordings")
+    q.add_argument("name")
+    q.add_argument("--pipeline", default="default", help="pipeline the profile is for")
+    q.add_argument(
+        "--recordings", help="comma-separated recording ids (default: every 'silence' recording)"
+    )
+    q.add_argument(
+        "--position",
+        type=int,
+        help="filter index the gate sits at (default: the pipeline's spectral_gate, else the end)",
+    )
+    q.add_argument("--add", action="store_true", help="also add/point a spectral_gate at it")
+    q.set_defaults(fn=cmd_noise_create)
+    q = nsub.add_parser("delete", help="delete a noise profile")
+    q.add_argument("name")
+    q.set_defaults(fn=cmd_noise_delete)
 
     args = ap.parse_args(argv)
     logging.basicConfig(

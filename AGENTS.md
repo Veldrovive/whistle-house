@@ -42,11 +42,13 @@ src/whistle_house/
   pipeline.py        PipelineSpec / Frontend / Pipeline / PipelineStore
   settings.py        .env loading; data dir (WHISTLE_HOUSE_DATA) + external root (WHISTLE_HOUSE_EXTERNAL)
   tunes.py           Tune model, TuneLibrary (data/tunes.json), note-template fitting
+  noise_profiles.py  per-bin silence stats for spectral_gate (data/noise_profiles/<name>.json)
   cli.py             `whistle-house` CLI: serve, devices, analyze, import, datasets, train-detector, warmstart
   stages/
     base.py          stage ABCs + registry (register, build_stage, list_stages)
     transforms/stft.py   StreamingSTFT core + stft_mel (v1 port) + stft_linear
     filters/basic.py     identity, noise_floor, frame_median, band_reject
+    filters/spectral_gate.py  gate against a measured noise profile (needs a silence recording)
     detectors/common.py  ContourTracker (links per-frame pitch candidates into notes)
     detectors/peak_tracker.py  heuristic baseline (also auto-labels clean whistle pitch)
     detectors/learned.py       WhistleNet-backed detector (torch, lazy import)
@@ -64,8 +66,9 @@ src/whistle_house/
 manager/             Vite + React + TS manager website
   src/api.ts         typed client — mirror of server/app.py routes
   src/pages/         Live, Data, Tunes, Pipelines, Models, Outputs
-  src/components/    Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView, RecordPanel
-tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, external data, server API
+  src/components/    Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView, RecordPanel,
+                     NoiseProfilePanel (extra controls under a spectral_gate filter)
+tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data, server API
 .env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines)
 ```
@@ -88,6 +91,8 @@ uv run whistle-house train-detector --name whistlenet --device auto
 uv run whistle-house datasets list             # external datasets + status
 uv run whistle-house datasets fetch all        # training machine only (refuses on a Pi)
 uv run whistle-house warmstart                 # fetch -> pretrain -> fine-tune (see below)
+uv run whistle-house noise-profile create room --add   # profile from all 'silence' recordings,
+                                               # + add a spectral_gate to the default pipeline
 
 # manager (node via mise: `mise install` once; prefix with `mise exec --` if mise isn't activated)
 cd manager && npm install
@@ -127,6 +132,13 @@ npm run lint
   `whistle` (clean, quiet room: becomes positives, with pitch auto-labelled by `peak_tracker`),
   `speech` (lots; the v1 failure mode), `noise`/`music` (TV, kitchen, doors…), `silence`.
   Tune examples are `whistle` clips with a `tune_id`.
+* **Mic self-noise: `spectral_gate`.** The USB mic is noisy (steady hiss, ~-35 dBFS). Record
+  20-30 s of `silence`, measure a noise profile (manager: the panel under a `spectral_gate`
+  filter; CLI: `noise-profile create`), and the gate keeps only bins > `n_std` noise std-devs
+  above the noise mean. On the real mic it removed every false event on held-out silence
+  (`noise_floor`: 30 in 28 s) and, unlike `noise_floor`, does not swallow long held notes.
+  Profiles are measured at the filter's position (upstream chain is fingerprinted; a mismatch
+  refuses to build) and are immutable: make a new one when the mic, gain or room changes.
 * **Noise robustness is synthetic.** `data/training.py` mixes clean whistles with interferers at
   random SNR (−3…25 dB), plus random gain, EQ and reverb. Interferers come from negative
   recordings on this mic, files in `data/noise/**`, and `synth_pseudo_speech` (harmonic stacks

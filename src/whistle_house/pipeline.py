@@ -74,12 +74,21 @@ class Frontend:
         )
         self.filters: list[Filter] = []
         axis = self.transform.axis
-        for f in filters:
+        for i, f in enumerate(filters):
+            # filters that depend on measured data (spectral_gate) check it was measured on
+            # the same upstream chain
+            upstream = {
+                "sample_rate": sample_rate,
+                "transform": transform.model_dump(),
+                "filters": [x.model_dump() for x in filters[:i]],
+            }
             flt: Filter = build_stage(  # type: ignore[assignment]
                 StageKind.filter,
                 f.name,
                 f.params,
-                StageContext(sample_rate, axis=axis, data_dir=data_dir),
+                StageContext(
+                    sample_rate, axis=axis, data_dir=data_dir, extra={"upstream": upstream}
+                ),
             )
             axis = flt.output_axis(axis)
             self.filters.append(flt)

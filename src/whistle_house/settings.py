@@ -87,6 +87,10 @@ class Paths:
         return self.root / "models"
 
     @property
+    def noise_profiles(self) -> Path:
+        return self.root / "noise_profiles"
+
+    @property
     def label_cache(self) -> Path:
         return self.root / "cache" / "labels"
 

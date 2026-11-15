@@ -12,6 +12,7 @@ import logging
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field
 from whistle_house.audio.io import to_mono_float
 from whistle_house.audio.sources import list_input_devices
 from whistle_house.data.store import LABELS, Recording, RecordingStore, RecordingUpdate
+from whistle_house.noise_profiles import NoiseProfileStore, profile_from_recordings
 from whistle_house.outputs import OutputInstance, OutputStore, list_output_types
 from whistle_house.pipeline import Pipeline, PipelineSpec, PipelineStore
 from whistle_house.server.engine import LiveEngine, encode_block
@@ -76,6 +78,13 @@ class TrainBody(BaseModel):
     external: list[str] = Field(default_factory=list)  # external dataset names
     init_from: str | None = None  # model name to fine-tune from
     workers: int = 2
+
+
+class NoiseProfileBody(BaseModel):
+    name: str
+    recording_ids: list[str]
+    spec: PipelineSpec  # the (possibly unsaved) pipeline the profile is for
+    position: int | None = None  # filter index of the gate (default: its spectral_gate, else end)
 
 
 class AppState:
@@ -205,6 +214,47 @@ def create_app(
         S.state["active_pipeline"] = name
         S.save_state()
         return S.engine.status()
+
+    # ------------------------------------------------------------------ noise profiles
+
+    @app.get("/api/noise-profiles")
+    def noise_profiles() -> list[dict]:
+        return [asdict(p) for p in NoiseProfileStore(S.paths.noise_profiles).list()]
+
+    @app.post("/api/noise-profiles")
+    def create_noise_profile(body: NoiseProfileBody) -> dict:
+        """Measure a profile from silence recordings for a (possibly unsaved) pipeline spec."""
+        store = NoiseProfileStore(S.paths.noise_profiles)
+        try:
+            if store.exists(body.name):
+                raise FileExistsError(f"noise profile {body.name!r} already exists")
+            prof = profile_from_recordings(
+                body.name,
+                body.spec.model_dump(),
+                S.recordings,
+                body.recording_ids,
+                body.position,
+                S.paths.root,
+            )
+            store.save(prof)
+        except (ValueError, KeyError, FileExistsError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e)) from e
+        return asdict(prof)
+
+    @app.delete("/api/noise-profiles/{name}")
+    def delete_noise_profile(name: str):
+        users = [
+            p.name
+            for p in S.pipelines.list()
+            if any(f.name == "spectral_gate" and f.params.get("profile") == name for f in p.filters)
+        ]
+        if users:
+            raise HTTPException(400, f"noise profile {name!r} is used by pipelines {users}")
+        try:
+            NoiseProfileStore(S.paths.noise_profiles).delete(name)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"ok": True}
 
     # ------------------------------------------------------------------ recordings
 

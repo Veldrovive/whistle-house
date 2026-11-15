@@ -154,6 +154,20 @@ export type DatasetsInfo = {
   mixes: Record<string, Record<string, number>>
 }
 
+/** Per-bin noise statistics measured from silence recordings (spectral_gate filter). */
+export type NoiseProfile = {
+  name: string
+  freqs: number[]
+  mean: number[]
+  std: number[]
+  upstream: { sample_rate: number; transform: StageSpec; filters: StageSpec[] }
+  sources: string[]
+  n_frames: number
+  n_dropped: number
+  duration_s: number
+  created: string
+}
+
 export class ApiError extends Error {}
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -258,6 +272,11 @@ export const api = {
     workers: number
   }) => req('POST', '/api/models/train', body),
   datasets: () => req<DatasetsInfo>('GET', '/api/datasets'),
+
+  noiseProfiles: () => req<NoiseProfile[]>('GET', '/api/noise-profiles'),
+  createNoiseProfile: (body: { name: string; recording_ids: string[]; spec: PipelineSpec; position?: number }) =>
+    req<NoiseProfile>('POST', '/api/noise-profiles', body),
+  deleteNoiseProfile: (name: string) => req('DELETE', `/api/noise-profiles/${encodeURIComponent(name)}`),
   stopTraining: (name: string) => req('POST', `/api/models/${name}/stop`),
   modelLog: (name: string) => req<{ log: string }>('GET', `/api/models/${name}/log`),
 }

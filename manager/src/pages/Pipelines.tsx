@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, type PipelineSpec, type StageInfo, type StageKind, type StageSpec } from '../api'
 import { AnalysisView } from '../components/AnalysisView'
+import { NoiseProfilePanel } from '../components/NoiseProfilePanel'
 import { SchemaForm } from '../components/SchemaForm'
 import { useAction, useLoad } from '../lib/hooks'
 
@@ -18,6 +19,7 @@ function StageEditor({
   onChange,
   onRemove,
   onMove,
+  children,
 }: {
   kind: StageKind
   spec: StageSpec
@@ -25,6 +27,7 @@ function StageEditor({
   onChange: (s: StageSpec) => void
   onRemove?: () => void
   onMove?: (d: -1 | 1) => void
+  children?: React.ReactNode
 }) {
   const info = options.find((o) => o.name === spec.name)
   return (
@@ -54,6 +57,7 @@ function StageEditor({
       ) : (
         <div className="error">unknown stage {spec.name}</div>
       )}
+      {children}
     </div>
   )
 }
@@ -156,7 +160,17 @@ export function Pipelines() {
             ;[fs[i], fs[j]] = [fs[j], fs[i]]
             set({ filters: fs })
           }}
-        />
+        >
+          {f.name === 'spectral_gate' && (
+            <NoiseProfilePanel
+              spec={edit}
+              index={i}
+              params={f.params}
+              onParams={(params) => set({ filters: edit.filters.map((x, j) => (j === i ? { ...x, params } : x)) })}
+              recordings={recs.data ?? []}
+            />
+          )}
+        </StageEditor>
       ))}
       <button onClick={() => set({ filters: [...edit.filters, { name: 'identity', params: {} }] })}>+ filter</button>
       <div className="muted small">{SLOT_HELP.detector}</div>

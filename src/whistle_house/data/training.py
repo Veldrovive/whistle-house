@@ -143,8 +143,15 @@ class TrainingSources:
         }
 
 
-def frontend_hash(frontend_spec: dict, labeler_params: dict) -> str:
+def frontend_hash(frontend_spec: dict, labeler_params: dict, data_dir: Path | None = None) -> str:
+    """Cache key for auto-labels. Includes the contents of any noise profile the frontend uses."""
     blob = json.dumps({"f": frontend_spec, "l": labeler_params}, sort_keys=True)
+    if data_dir is not None:
+        for f in frontend_spec.get("filters", []):
+            prof = f.get("params", {}).get("profile") if f.get("name") == "spectral_gate" else None
+            p = data_dir / "noise_profiles" / f"{prof}.json"
+            if prof and p.exists():
+                blob += hashlib.sha1(p.read_bytes()).hexdigest()
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
@@ -160,9 +167,15 @@ def events_to_f0(events: list[WhistleEvent], n_samples: int, sr: int) -> np.ndar
     return f0
 
 
-def auto_label(audio: np.ndarray, sr: int, frontend_spec: dict, labeler_params: dict) -> np.ndarray:
+def auto_label(
+    audio: np.ndarray,
+    sr: int,
+    frontend_spec: dict,
+    labeler_params: dict,
+    data_dir: Path | None = None,
+) -> np.ndarray:
     """Clean audio -> f0 track at LABEL_RATE via the frontend + peak_tracker."""
-    fe = Frontend.from_dict(frontend_spec)
+    fe = Frontend.from_dict(frontend_spec, data_dir)
     if sr != fe.sample_rate:
         audio = resample(audio, sr, fe.sample_rate)
         sr = fe.sample_rate
@@ -174,9 +187,9 @@ def auto_label(audio: np.ndarray, sr: int, frontend_spec: dict, labeler_params: 
 
 
 def _label_job(args) -> tuple[str, np.ndarray]:
-    key, path, segments, frontend_spec, labeler_params = args
+    key, path, segments, frontend_spec, labeler_params, data_dir = args
     audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    f0 = auto_label(to_mono_float(audio), sr, frontend_spec, labeler_params)
+    f0 = auto_label(to_mono_float(audio), sr, frontend_spec, labeler_params, data_dir)
     if segments:  # restrict to annotated whistle segments
         mask = np.zeros(len(f0), bool)
         for s, e in segments:
@@ -201,12 +214,13 @@ class LabelCache:
         frontend_spec: dict,
         labeler_params: dict,
         workers: int = 4,
+        data_dir: Path | None = None,
     ) -> dict[str, np.ndarray]:
         """Compute labels for (key, path, segments) items not yet cached."""
         todo = [i for i in items if i[0] not in self.labels]
         if todo:
             log.info("auto-labelling %d clips -> %s", len(todo), self.path.name)
-            jobs = [(k, p, s, frontend_spec, labeler_params) for k, p, s in todo]
+            jobs = [(k, p, s, frontend_spec, labeler_params, data_dir) for k, p, s in todo]
             if workers > 1:
                 with ProcessPoolExecutor(workers, mp_context=_mp_context()) as pool:
                     for n, (k, f0) in enumerate(pool.map(_label_job, jobs, chunksize=4)):
@@ -233,12 +247,13 @@ def collect_sources(
     noise_dirs: list[Path] | None = None,
     config: GeneratorConfig | None = None,
     workers: int = 4,
+    data_dir: Path | None = None,
 ) -> TrainingSources:
     """Gather + auto-label every source for the given splits."""
     from whistle_house.external.base import POSITIVE_LABELS, get_dataset, load_manifest
 
     cfg = config or GeneratorConfig()
-    fh = frontend_hash(frontend_spec, cfg.labeler_params)
+    fh = frontend_hash(frontend_spec, cfg.labeler_params, data_dir)
     src = TrainingSources()
 
     if store is not None:
@@ -257,7 +272,7 @@ def collect_sources(
                 mic_neg.append(path)
         if pos_items:
             cache = LabelCache(label_cache_dir or Path("."), "mic", fh)
-            labels = cache.ensure(pos_items, frontend_spec, cfg.labeler_params, workers)
+            labels = cache.ensure(pos_items, frontend_spec, cfg.labeler_params, workers, data_dir)
             src.mic_positives = [PositiveClip(k, p, labels[k]) for k, p, _ in pos_items]
         if mic_neg:
             src.interferers["mic"] = mic_neg
@@ -274,7 +289,7 @@ def collect_sources(
             if pos:
                 items = [(f"{name}/{e.path}", str(ds.prepared_dir / e.path), []) for e in pos]
                 cache = LabelCache(external_root / "labels", name, fh)
-                labels = cache.ensure(items, frontend_spec, cfg.labeler_params, workers)
+                labels = cache.ensure(items, frontend_spec, cfg.labeler_params, workers, data_dir)
                 kept = [
                     PositiveClip(k, p, labels[k])
                     for k, p, _ in items
@@ -337,9 +352,10 @@ class ExampleGenerator:
         frontend_spec: dict,
         sources: TrainingSources,
         config: GeneratorConfig | None = None,
+        data_dir: Path | None = None,
     ):
         self.cfg = config or GeneratorConfig()
-        self.frontend = Frontend.from_dict(frontend_spec)
+        self.frontend = Frontend.from_dict(frontend_spec, data_dir)
         self.sr = self.frontend.sample_rate
         self.sources = sources
         self._clips = _ClipCache(self.sr)
