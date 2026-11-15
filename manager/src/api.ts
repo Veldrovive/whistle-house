@@ -170,7 +170,7 @@ export type NoiseProfile = {
 
 export class ApiError extends Error {}
 
-async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function req<T>(method: string, path: string, body?: unknown, as: 'json' | 'blob' = 'json'): Promise<T> {
   const init: RequestInit = { method }
   if (body instanceof FormData) init.body = body
   else if (body !== undefined) {
@@ -188,7 +188,7 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     }
     throw new ApiError(msg)
   }
-  return r.json() as Promise<T>
+  return (as === 'blob' ? r.blob() : r.json()) as Promise<T>
 }
 
 export const api = {
@@ -233,6 +233,14 @@ export const api = {
   capture: (meta: { seconds: number; label: string; tune_id?: string | null }) =>
     req<Recording>('POST', '/api/record/capture', meta),
 
+  /** The recording after the pipeline's transform + filters, resynthesised (WAV blob). */
+  renderProcessed: (recording_id: string, pipeline?: string | PipelineSpec) =>
+    req<Blob>(
+      'POST',
+      '/api/render',
+      typeof pipeline === 'object' ? { recording_id, spec: pipeline } : { recording_id, pipeline },
+      'blob',
+    ),
   analyze: (recording_id: string, pipeline?: string | PipelineSpec) =>
     req<Analysis>(
       'POST',

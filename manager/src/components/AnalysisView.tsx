@@ -12,6 +12,9 @@ export function AnalysisView({
   pipeline?: string | PipelineSpec
 }) {
   const [res, setRes] = useState<Analysis | null>(null)
+  const [source, setSource] = useState<'original' | 'processed'>('original')
+  const [processedUrl, setProcessedUrl] = useState<string | null>(null)
+  const render = useAction()
   const [playhead, setPlayhead] = useState<number | null>(null)
   const audio = useRef<HTMLAudioElement>(null)
   const { busy, error, run } = useAction()
@@ -22,6 +25,48 @@ export function AnalysisView({
     run(() => api.analyze(recording.id, pipeline)).then((r) => r && setRes(r))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recording.id, key])
+
+  // processed audio is rendered on demand and invalidated when the recording/pipeline changes
+  useEffect(() => {
+    setSource('original')
+    setProcessedUrl(null)
+  }, [recording.id, key])
+  useEffect(() => {
+    if (source !== 'processed' || processedUrl) return
+    let stale = false
+    render.run(() => api.renderProcessed(recording.id, pipeline)).then((blob) => {
+      if (stale) return
+      if (blob) setProcessedUrl(URL.createObjectURL(blob))
+      else setSource('original')
+    })
+    return () => {
+      stale = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source, processedUrl, recording.id, key])
+  // free the blob when it is replaced or the view unmounts
+  useEffect(
+    () => () => {
+      if (processedUrl) URL.revokeObjectURL(processedUrl)
+    },
+    [processedUrl],
+  )
+  const switchTo = (s: 'original' | 'processed') => {
+    // keep the playback position when flipping between the two
+    const t = audio.current?.currentTime ?? 0
+    const playing = audio.current ? !audio.current.paused : false
+    setSource(s)
+    requestAnimationFrame(() => {
+      if (!audio.current) return
+      const restore = () => {
+        audio.current!.currentTime = t
+        if (playing) audio.current!.play()
+      }
+      if (audio.current.readyState >= 1) restore()
+      else audio.current.addEventListener('loadedmetadata', restore, { once: true })
+    })
+  }
+  const src = source === 'processed' ? processedUrl : api.audioUrl(recording.id)
 
   const raw = useMemo(() => (res ? decodeBlock(res.raw) : null), [res])
   const filt = useMemo(() => (res ? decodeBlock(res.filtered) : null), [res])
@@ -34,12 +79,26 @@ export function AnalysisView({
 
   return (
     <div className="analysis">
-      <audio
-        ref={audio}
-        controls
-        src={api.audioUrl(recording.id)}
-        onTimeUpdate={(e) => setPlayhead((e.target as HTMLAudioElement).currentTime)}
-      />
+      <div className="row wrap">
+        <audio
+          ref={audio}
+          controls
+          src={src ?? undefined}
+          onTimeUpdate={(e) => setPlayhead((e.target as HTMLAudioElement).currentTime)}
+        />
+        <div
+          className="row"
+          title="Processed = the recording after the pipeline's transform + filters, turned back into sound: only the transform's frequency range, with whatever the filters removed taken out. Roughly what the detector hears."
+        >
+          <button className={source === 'original' ? 'sel' : ''} onClick={() => switchTo('original')}>
+            Original
+          </button>
+          <button className={source === 'processed' ? 'sel' : ''} onClick={() => switchTo('processed')}>
+            {render.busy ? 'Rendering…' : 'Processed'}
+          </button>
+        </div>
+        {render.error && <span className="error small">{render.error}</span>}
+      </div>
       {busy && <div className="muted">analysing…</div>}
       {error && <div className="error">{error}</div>}
       {res && raw && filt && (

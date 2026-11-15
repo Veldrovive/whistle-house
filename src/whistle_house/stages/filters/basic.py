@@ -27,6 +27,7 @@ class NoiseFloor(Filter):
     """
 
     name = "noise_floor"
+    relative_output = True
 
     class Config(StageConfig):
         rise_rate: float = Field(
@@ -64,6 +65,7 @@ class FrameMedian(Filter):
     """Subtract each frame's median across bins (removes broadband loudness changes)."""
 
     name = "frame_median"
+    relative_output = True
 
     class Config(StageConfig):
         clip_zero: bool = Field(True, description="Clip negative results to 0")

@@ -16,7 +16,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -346,6 +346,8 @@ def create_app(
 
     @app.post("/api/analyze")
     async def analyze(body: AnalyzeBody):
+        if not S.recordings.audio_path(body.recording_id).exists():
+            raise HTTPException(404, f"recording {body.recording_id} not found")
         spec = body.spec or (S.pipelines.get(body.pipeline) if body.pipeline else S.active_spec())
         try:
             pipe, res = await asyncio.to_thread(_analyze, spec, body.recording_id)
@@ -363,6 +365,32 @@ def create_app(
             "events": [e.to_json() for e in res.events],
             "matches": [m.to_json() for m in res.matches],
         }
+
+    @app.post("/api/render")
+    async def render(body: AnalyzeBody):
+        """The recording after the pipeline's transform + filters, resynthesised as WAV."""
+        import soundfile as sf
+
+        from whistle_house.audio.render import render_processed
+
+        if not S.recordings.audio_path(body.recording_id).exists():
+            raise HTTPException(404, f"recording {body.recording_id} not found")
+        spec = body.spec or (S.pipelines.get(body.pipeline) if body.pipeline else S.active_spec())
+
+        def work() -> bytes:
+            audio, _ = S.recordings.load(body.recording_id, spec.sample_rate)
+            out = render_processed(to_mono_float(audio), spec, S.paths.root)
+            buf = io.BytesIO()
+            sf.write(buf, out, spec.sample_rate, format="WAV", subtype="PCM_16")
+            return buf.getvalue()
+
+        try:
+            wav = await asyncio.to_thread(work)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except Exception as e:
+            raise HTTPException(400, f"{type(e).__name__}: {e}") from e
+        return Response(wav, media_type="audio/wav")
 
     # ------------------------------------------------------------------ tunes
 

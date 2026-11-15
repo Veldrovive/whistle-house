@@ -94,6 +94,10 @@ class Filter(Stage):
     """
 
     kind = StageKind.filter
+    # False: output is in the input's units (e.g. absolute dB; band_reject, identity).
+    # True: output is "dB above a floor", 0 = floor (noise_floor, spectral_gate, ...).
+    # Only used to turn filter output back into audio (audio/render.py); no effect on processing.
+    relative_output: ClassVar[bool] = False
 
     def output_axis(self, axis: FrequencyAxis) -> FrequencyAxis:
         return axis

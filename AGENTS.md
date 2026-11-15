@@ -53,7 +53,8 @@ src/whistle_house/
     detectors/peak_tracker.py  heuristic baseline (also auto-labels clean whistle pitch)
     detectors/learned.py       WhistleNet-backed detector (torch, lazy import)
     recognizers/note_template.py  key/tempo-invariant per-note template matching
-  audio/             io.py (load/save/resample), sources.py (MicSource, ReplaySource, ArraySource)
+  audio/             io.py (load/save/resample), sources.py (MicSource, ReplaySource, ArraySource),
+                     render.py (filtered frames -> audio: the "Processed" playback in the manager)
   data/
     store.py         recordings: data/recordings/<id>.wav + <id>.json (label, tune, segments, split)
     augment.py       mix_at_snr, gain/EQ/reverb, synth_whistle, synth_pseudo_speech
@@ -66,7 +67,8 @@ src/whistle_house/
 manager/             Vite + React + TS manager website
   src/api.ts         typed client — mirror of server/app.py routes
   src/pages/         Live, Data, Tunes, Pipelines, Models, Outputs
-  src/components/    Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView, RecordPanel,
+  src/components/    Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView
+                     (spectrograms + Original/Processed playback), RecordPanel,
                      NoiseProfilePanel (extra controls under a spectral_gate filter)
 tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data, server API
 .env.example         settings template; copy to .env (gitignored)
@@ -111,7 +113,8 @@ npm run lint
 2. **Adding a stage implementation:** subclass the base in `stages/base.py`, set `name`, define
    `Config(StageConfig)`, implement `process`/`push` (+ `reset`, + `flush` for detectors),
    decorate with `@register`, and import the module in the slot's `__init__.py`. Add a test
-   (streaming == offline at minimum).
+   (streaming == offline at minimum). Filters whose output is "dB above a floor" (0 = floor)
+   set `relative_output = True` so Processed playback (`audio/render.py`) maps them correctly.
 3. **Don't change the behaviour of an existing registered stage** in ways that change its
    output (trained checkpoints depend on the frontend). Add a new name or a new config field
    whose default keeps the old behaviour. `tests/test_transform.py` pins `stft_mel` to v1.

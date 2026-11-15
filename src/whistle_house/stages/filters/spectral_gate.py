@@ -37,6 +37,7 @@ class SpectralGate(Filter):
     """Suppress the mic's stationary noise using a profile measured from silence recordings."""
 
     name = "spectral_gate"
+    relative_output = True
 
     class Config(StageConfig):
         profile: str = Field(
