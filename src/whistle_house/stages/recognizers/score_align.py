@@ -540,10 +540,16 @@ class ScoreAlignRecognizer(TuneRecognizer):
             # Pieces a quarter of the tune's shortest note at its written tempo, coarser if
             # that would be more pieces than max_steps.
             piece_s = max(0.05, 0.25 * min(prep.beats) * prep.seconds_per_beat)
-            pieces = subdivide(st.steps, piece_s)
-            while len(pieces) > c.max_steps:
+            # Only the curve the tune could lie in: its length at the slowest tempo, with
+            # room for timing errors. Older steps cannot be part of a match that ends now.
+            window = 1.5 * prep.total_beats * prep.seconds_per_beat / c.min_tempo_ratio
+            steps = [s for s in st.steps if s.end > st.last_end - window][-c.max_steps :]
+            pieces = subdivide(steps, piece_s)
+            # Coarsening cannot give fewer pieces than steps, so stop once pieces are as
+            # long as the window and keep the newest.
+            while len(pieces) > c.max_steps and piece_s < window:
                 piece_s *= 1.5
-                pieces = subdivide(st.steps, piece_s)
+                pieces = subdivide(steps, piece_s)
             pieces = pieces[-c.max_steps :]
             if c.quiet_before_s > 0:
                 starts = [j for j, s in enumerate(pieces) if s.gap_before >= c.quiet_before_s]

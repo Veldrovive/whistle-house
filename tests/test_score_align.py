@@ -361,6 +361,21 @@ def test_fires_only_after_the_quiet_and_twice_for_two_performances(tmp_path):
     assert matches[1].meta["key"] - matches[0].meta["key"] == pytest.approx(5, abs=0.3)
 
 
+def test_minutes_of_unbroken_sound_before_a_tune(tmp_path):
+    """Far more pitch steps than ``max_steps`` (a room hum that never stops, a long
+    recording): evaluation stays bounded and a tune after it still matches."""
+    rec = recognizer(tmp_path, tunes={"arpeggio": ARPEGGIO})
+    rng = np.random.default_rng(3)
+    babble = score([(int(p), 0.25) for p in rng.integers(55, 80, 600)])
+    t1, c1 = perform(babble, Style(legato=1.0, tail_s=1.5), rng)
+    assert len(curve_events(t1, c1)) > 200
+    t2, c2 = perform(ARPEGGIO, Style(transpose=3), rng)
+    times = np.concatenate([t1, t2 + t1[-1] + FRAME_S])
+    matches = listen(rec, times, np.concatenate([c1, c2]))
+    assert names(matches)[-1:] == ["arpeggio"]
+    assert matches[-1].time > t1[-1]
+
+
 # --------------------------------------------------------------------------- streaming
 
 
