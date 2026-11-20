@@ -36,6 +36,8 @@ def test_parse_env_file(monkeypatch):
 
 
 def test_load_env_sets_external_root(tmp_path, monkeypatch):
+    # Don't let a real .env in the repo (training machine) configure the root behind our back.
+    monkeypatch.setattr("whistle_house.settings._env_loaded", True)
     monkeypatch.delenv("WHISTLE_HOUSE_EXTERNAL", raising=False)
     with pytest.raises(ExternalNotConfigured):
         external_root()
@@ -187,3 +189,32 @@ def test_train_pretrain_then_finetune(tmp_path, monkeypatch):
     other = PipelineSpec(transform={"name": "stft_mel", "params": {"n_mels": 64}})
     with pytest.raises(ValueError, match="different front-end"):
         train(other, paths, "bad", TrainConfig(**small, init_from="pre", workers=0))
+
+
+def test_download_many_skips_files_missing_upstream(tmp_path, monkeypatch):
+    """A 404 (file listed but no longer hosted) is skipped without retries; the rest download."""
+    import io
+    import types
+    import urllib.error
+
+    from whistle_house.external import base
+
+    calls: list[str] = []
+
+    class Resp(io.BytesIO):
+        status = 200
+        headers = types.MappingProxyType({})
+
+    def fake_urlopen(req, timeout=0):
+        calls.append(req.full_url)
+        if req.full_url.endswith("gone.wav"):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
+        return Resp(b"audio")
+
+    monkeypatch.setattr(base.urllib.request, "urlopen", fake_urlopen)
+    items = [(f"http://x/{n}", tmp_path / n) for n in ("a.wav", "gone.wav", "b.wav")]
+    missing = base.download_many(items, workers=2)
+    assert missing == ["http://x/gone.wav"]
+    assert (tmp_path / "a.wav").read_bytes() == b"audio"
+    assert (tmp_path / "b.wav").exists() and not (tmp_path / "gone.wav").exists()
+    assert calls.count("http://x/gone.wav") == 1

@@ -25,6 +25,7 @@ import os
 import shutil
 import tarfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
@@ -239,7 +240,10 @@ def standardise_audio(src: Path, dst: Path, channel: int | None = None) -> tuple
 
 
 def download_file(url: str, dest: Path, retries: int = 5, quiet: bool = False) -> Path:
-    """Resumable HTTP download (Range requests) with a simple progress line."""
+    """Resumable HTTP download (Range requests) with a simple progress line.
+
+    A 404 is permanent, so it raises FileNotFoundError at once instead of retrying.
+    """
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -269,29 +273,53 @@ def download_file(url: str, dest: Path, retries: int = 5, quiet: bool = False) -
                 print(f"\r  {dest.name}: done ({part.stat().st_size / 1e6:,.0f} MB)        ")
             part.replace(dest)
             return dest
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise FileNotFoundError(f"{url} does not exist (HTTP 404)") from None
+            log.warning("download %s failed (attempt %d/%d): %s", url, attempt, retries, e)
+            time.sleep(min(30, 2**attempt))
         except Exception as e:  # noqa: BLE001 - network errors: retry with resume
             log.warning("download %s failed (attempt %d/%d): %s", url, attempt, retries, e)
             time.sleep(min(30, 2**attempt))
     raise RuntimeError(f"failed to download {url}")
 
 
-def download_many(items: list[tuple[str, Path]], workers: int | None = None) -> None:
-    """Many small files in parallel (skips existing)."""
+def download_many(items: list[tuple[str, Path]], workers: int | None = None) -> list[str]:
+    """Many small files in parallel (skips existing). Returns the URLs that do not exist.
+
+    Files the publisher lists but no longer hosts (404) are skipped with a warning rather than
+    failing the whole fetch; any other download failure still raises.
+    """
     workers = workers or int(os.environ.get("WHISTLE_HOUSE_DOWNLOAD_WORKERS", "8"))
     todo = [(u, p) for u, p in items if not p.exists()]
     print(f"  {len(items) - len(todo)} already present, downloading {len(todo)} files")
     done = 0
+    missing: list[str] = []
 
-    def one(item):
-        download_file(*item, quiet=True)
+    def one(item) -> str | None:
+        try:
+            download_file(*item, quiet=True)
+        except FileNotFoundError:
+            return item[0]
+        return None
 
     with ThreadPoolExecutor(workers) as pool:
-        for _ in pool.map(one, todo):
+        for gone in pool.map(one, todo):
             done += 1
+            if gone:
+                missing.append(gone)
             if done % 100 == 0 or done == len(todo):
                 print(f"\r  {done}/{len(todo)} files", end="", flush=True)
     if todo:
         print()
+    if missing:
+        log.warning("%d file(s) missing upstream (HTTP 404), skipped", len(missing))
+        print(
+            f"  skipped {len(missing)} file(s) missing upstream: "
+            + ", ".join(u.rsplit("/", 1)[-1] for u in missing[:20])
+            + (" ..." if len(missing) > 20 else "")
+        )
+    return missing
 
 
 def extract(archive: Path, into: Path) -> None:
