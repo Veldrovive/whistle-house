@@ -130,6 +130,27 @@ npm run build    # -> manager/dist, served by `whistle-house serve`
 npm run lint
 ```
 
+### Running the server: always in tmux
+
+`serve` runs in one agreed place, the **`server` window of the tmux session `whistle-house`**,
+started from the repo root, so any agent or human can find it, read its log and restart it.
+Don't start `serve` any other way (background job, another terminal, a second copy): one
+process owns :8000 and the mic. Check for it first; if it's there, reuse it. tmux comes from
+Homebrew on the Mac (`brew install tmux`), apt on the Pi.
+
+```bash
+tmux has-session -t whistle-house 2>/dev/null || tmux new-session -d -s whistle-house -n server -c "$PWD"
+tmux send-keys -t whistle-house:server 'uv run whistle-house serve' Enter     # start (add flags as needed)
+tmux capture-pane -p -t whistle-house:server -S -200                          # read its output
+tmux send-keys -t whistle-house:server C-c                                    # stop; then send the
+                                                                              # start line again to restart
+tmux attach -t whistle-house                                                  # watch it yourself
+```
+
+The window holds a shell and the server is typed into it, so a crash leaves the traceback
+readable in the pane. Restart after backend changes; say in your report if you restarted it
+with different flags than it had (look at the pane for the last command line).
+
 ## Rules
 
 1. **Keep the manager up to date.** The manager is the one place to see and control the system.
