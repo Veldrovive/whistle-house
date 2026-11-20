@@ -125,8 +125,18 @@ class TuneRecognizer(Stage):
     kind = StageKind.recognizer
 
     @abstractmethod
-    def process(self, events: list[WhistleEvent], now: float) -> list[TuneMatch]:
-        """Called once per block with the events that finished in it (possibly empty)."""
+    def process(
+        self, events: list[WhistleEvent], now: float, active: list[WhistleEvent] | None = None
+    ) -> list[TuneMatch]:
+        """Called once per block with the events that finished in it (possibly empty).
+
+        ``active`` is the notes still sounding (``DetectorOutput.active``), for recognizers
+        that wait for quiet after a tune; None when the caller does not know.
+        """
+
+    def flush(self, now: float) -> list[TuneMatch]:
+        """End of stream: matches a recognizer was still holding back (waiting for quiet)."""
+        return []
 
 
 # --------------------------------------------------------------------------- registry

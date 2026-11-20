@@ -166,6 +166,7 @@ export function AnalysisView({
             freqs={res.axis.freqs}
             times={res.filtered.times}
             events={res.events}
+            notes={res.matches.flatMap((m) => m.meta?.notes ?? [])}
             scores={res.scores}
             kindScores={res.kind_scores}
             playhead={playhead}
@@ -179,6 +180,13 @@ export function AnalysisView({
                 <div key={i} className="match">
                   <b>{m.tune_name}</b> at {m.time.toFixed(2)}s · score {m.score.toFixed(2)}
                   {m.kind && m.kind !== 'whistle' ? ` · ${m.kind}` : ''}
+                  {m.meta?.tempo_bpm !== undefined && m.meta.key !== undefined && (
+                    <div className="small muted" title="The green bars on the spectrogram are the written notes where they were found">
+                      {m.meta.tempo_bpm.toFixed(0)} bpm · {m.meta.key >= 0 ? '+' : ''}
+                      {m.meta.key.toFixed(1)} semitones from written
+                      {m.meta.slurred ? ` · ${m.meta.slurred} repeated notes run together` : ''}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

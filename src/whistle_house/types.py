@@ -144,6 +144,8 @@ class TuneMatch:
     score: float  # recognizer-specific, higher is better
     events: list[WhistleEvent] = field(default_factory=list)
     kind: str = "whistle"  # how the tune was performed: the kind of its events
+    # recognizer-specific details for display (score_align: key, tempo, where each note fell)
+    meta: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
@@ -152,5 +154,6 @@ class TuneMatch:
             "time": self.time,
             "score": self.score,
             "kind": self.kind,
+            "meta": self.meta,
             "events": [e.to_json() for e in self.events],
         }

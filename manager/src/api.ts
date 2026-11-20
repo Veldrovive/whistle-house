@@ -58,6 +58,10 @@ export type NoteTemplate = {
   log_duration: FeatureStat
   glide: FeatureStat
 }
+/** One written note (pitch = MIDI number) or rest (pitch null). A quarter note is 1 beat. */
+export type ScoreNote = { pitch: number | null; beats: number; flat?: boolean }
+/** A tune as sheet music; matched by the score_align recognizer in any key and tempo. */
+export type Score = { tempo_bpm: number; beats_per_bar: number; notes: ScoreNote[] }
 export type Tune = {
   id: string
   name: string
@@ -65,6 +69,7 @@ export type Tune = {
   enabled: boolean
   examples: string[]
   template: { notes: NoteTemplate[]; log_span: FeatureStat; n_examples: number } | null
+  score: Score | null
   outputs: string[]
   threshold: number | null
 }
@@ -105,6 +110,14 @@ export type MatchJson = {
   kind?: string
   events: EventJson[]
   wall_time?: number
+  /** score_align: the key (semitones above the written pitch) and tempo it was performed
+   *  in, and where each written note was found */
+  meta?: {
+    key?: number
+    tempo_bpm?: number
+    slurred?: number
+    notes?: { start: number; end: number; hz: number; pitch: number }[]
+  }
 }
 /** pYIN pitch track of a recording (offline hum labeller); f0 = 0 where unvoiced. */
 export type HumPitch = {

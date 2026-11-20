@@ -97,3 +97,40 @@ def test_datasets_endpoint(tmp_path, monkeypatch):
         assert info["root"] is None
         assert {d["name"] for d in info["datasets"]} >= {"mlend_whistles", "musan", "esc50"}
         assert set(info["mixes"]) == {"mic", "pretrain", "finetune"}
+
+
+def test_written_tune_roundtrip_and_match(tmp_path):
+    from whistle_house.data.perform import Style, perform, render_audio
+    from whistle_house.tunes import Score
+
+    notes = [{"pitch": p, "beats": b} for p, b in [(60, 1), (64, 1), (67, 1), (None, 1), (72, 2)]]
+    with TestClient(create_app(Paths(tmp_path), live=False)) as c:
+        tune = c.post("/api/tunes", json={"name": "call", "score": {"notes": notes}}).json()
+        assert tune["score"]["tempo_bpm"] == 100 and tune["score"]["notes"][3]["pitch"] is None
+        tune["score"]["tempo_bpm"] = 120
+        tune["score"]["notes"][0]["flat"] = True
+        saved = c.put(f"/api/tunes/{tune['id']}", json=tune).json()
+        assert saved["score"]["tempo_bpm"] == 120 and c.get("/api/tunes").json() == [saved]
+        bad = {**tune, "score": {"notes": [{"pitch": 60, "beats": 0}]}}
+        assert c.put(f"/api/tunes/{tune['id']}", json=bad).status_code == 422
+
+        # the recognizer is a stage like any other: listed with its form, usable in a pipeline
+        stages = c.get("/api/stages").json()["recognizer"]
+        assert "quiet_before_s" in next(s for s in stages if s["name"] == "score_align")["defaults"]
+        spec = c.get("/api/pipelines").json()["pipelines"][0]
+        spec["recognizer"] = {"name": "score_align", "params": {}}
+        assert c.put("/api/pipelines/written", json=spec).status_code == 200
+
+        style = Style(transpose=24, tempo_scale=0.9, legato=1.0, slide_s=0.08)
+        times, curve = perform(
+            Score.model_validate(saved["score"]), style, np.random.default_rng(0)
+        )
+        rec = c.post(
+            "/api/recordings/upload",
+            files={"file": ("a.wav", _wav(render_audio(times, curve, SR)), "audio/wav")},
+            data={"label": "whistle"},
+        ).json()
+        res = c.post("/api/analyze", json={"recording_id": rec["id"], "pipeline": "written"}).json()
+        (match,) = res["matches"]
+        assert match["tune_name"] == "call" and len(match["meta"]["notes"]) == 4
+        assert abs(match["meta"]["key"] - 24) < 0.5

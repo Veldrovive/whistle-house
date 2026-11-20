@@ -49,6 +49,8 @@ export type SpectrogramProps = {
   times: number[] // frame centre times
   events?: EventJson[]
   active?: EventJson[]
+  /** where a matched tune's written notes were found: bars at the pitch each should have */
+  notes?: { start: number; end: number; hz: number }[]
   /** reference pitch track (e.g. pYIN hum labels): [time s, Hz] points, Hz 0 = gap */
   pitch?: [number, number][]
   scores?: number[]
@@ -141,6 +143,9 @@ export function Spectrogram(p: SpectrogramProps) {
         ))}
         {p.events?.map((e, i) => (
           <polyline key={i} points={line(e)} className={`ev ${kindClass(e)}`} vectorEffect="non-scaling-stroke" />
+        ))}
+        {p.notes?.map((n, i) => (
+          <line key={`n${i}`} x1={x(n.start)} x2={x(n.end)} y1={y(n.hz)} y2={y(n.hz)} className="tune-note" vectorEffect="non-scaling-stroke" />
         ))}
         {pitchRuns.map((r, i) => (
           <polyline

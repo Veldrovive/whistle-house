@@ -175,12 +175,13 @@ class Pipeline:
         self._samples_seen += len(samples)
         raw, filtered = self.frontend.push(samples)
         det = self.detector.process(filtered)
-        matches = self.recognizer.process(det.events, self.now)
+        matches = self.recognizer.process(det.events, self.now, det.active)
         return StepResult(raw, filtered, det, matches)
 
     def flush(self) -> tuple[list[WhistleEvent], list[TuneMatch]]:
         events = self.detector.flush()
-        return events, self.recognizer.process(events, self.now)
+        matches = self.recognizer.process(events, self.now, [])
+        return events, matches + self.recognizer.flush(self.now)
 
     def analyze(self, samples: np.ndarray) -> AnalysisResult:
         """Run a whole recording through the streaming path from a fresh state."""

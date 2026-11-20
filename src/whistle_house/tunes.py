@@ -1,8 +1,12 @@
 """Tune definitions (what to listen for) and which outputs they trigger.
 
-Stored as ``<data_dir>/tunes.json``. A tune is learned from example recordings: the pipeline's
-front-end + detector turns each example into whistle events, and a recognizer-specific
-template is fitted to them (see ``fit_note_template``).
+Stored as ``<data_dir>/tunes.json``. A tune is defined in one of two ways:
+
+* written as sheet music (``Tune.score``: notes and rests with lengths in beats, and a base
+  tempo), matched by the ``score_align`` recognizer, which is loose about key and tempo;
+* learned from example recordings: the pipeline's front-end + detector turns each example into
+  whistle events and a template is fitted to them (``fit_note_template``), matched by the
+  ``note_template`` recognizer.
 """
 
 from __future__ import annotations
@@ -39,6 +43,30 @@ class TuneTemplate(BaseModel):
     n_examples: int
 
 
+class ScoreNote(BaseModel):
+    """One written note or rest. A quarter note is 1 beat."""
+
+    pitch: int | None = Field(None, ge=0, le=127, description="MIDI note number; None = rest")
+    beats: float = Field(1.0, gt=0, le=16, description="Length in quarter notes")
+    flat: bool = Field(False, description="Display only: spell a black key as a flat")
+
+
+class Score(BaseModel):
+    """A tune as sheet music. Only the intervals and the relative note lengths are matched:
+    the key it is performed in and the tempo are free (see ``score_align``)."""
+
+    tempo_bpm: float = Field(100.0, ge=20, le=400, description="Quarter notes per minute")
+    beats_per_bar: int = Field(4, ge=1, le=12, description="Display only: where bar lines go")
+    notes: list[ScoreNote] = Field(default_factory=list)
+
+    def sounding(self) -> list[ScoreNote]:
+        return [n for n in self.notes if n.pitch is not None]
+
+    @property
+    def seconds_per_beat(self) -> float:
+        return 60.0 / self.tempo_bpm
+
+
 class Tune(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     name: str
@@ -46,6 +74,7 @@ class Tune(BaseModel):
     enabled: bool = True
     examples: list[str] = Field(default_factory=list, description="recording ids")
     template: TuneTemplate | None = None
+    score: Score | None = Field(None, description="sheet-music definition (score_align)")
     outputs: list[str] = Field(default_factory=list, description="output ids to fire on match")
     threshold: float | None = Field(None, description="per-tune override of recognizer threshold")
 

@@ -55,7 +55,9 @@ class NoteTemplateRecognizer(TuneRecognizer):
         self._recent: dict[str, list[WhistleEvent]] = {}  # per event kind (whistle, hum)
         self._last_fired: dict[str, float] = {}
 
-    def process(self, events: list[WhistleEvent], now: float) -> list[TuneMatch]:
+    def process(
+        self, events: list[WhistleEvent], now: float, active: list[WhistleEvent] | None = None
+    ) -> list[TuneMatch]:
         if not events or self.ctx.tunes is None:
             return []
         c = self.config
