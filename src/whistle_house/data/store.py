@@ -8,6 +8,9 @@ Recordings are made on the deployment mic (manager Live/Collect page) or uploade
 matter for the learned detector:
 
 * ``whistle``  - clean whistling (positives; pitch labels are derived automatically)
+* ``hum``      - clean humming (a harmonic stack with a low fundamental). Positives for a model
+  with a ``hum`` class (pitch labelled by pYIN, ``data/hum_labels.py``); a whistle-only model
+  trains on them as hard negatives (the ``hum`` interferer group, with the external hums).
 * ``speech``   - talking with no whistling (the v1 false-trigger problem - collect lots!)
 * ``noise``    - TV, music, kitchen, door slams, ... anything that isn't whistling
 * ``silence``  - room tone
@@ -28,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from whistle_house.audio.io import load_audio, save_wav
 
-LABELS = ["whistle", "speech", "noise", "music", "silence", "other"]
+LABELS = ["whistle", "hum", "speech", "noise", "music", "silence", "other"]
 NEGATIVE_LABELS = {"speech", "noise", "music", "silence"}
 
 Split = Literal["train", "val", "test"]

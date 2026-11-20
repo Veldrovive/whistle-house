@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, decodeBlock, type Analysis, type PipelineSpec, type Recording } from '../api'
+import { api, decodeBlock, type Analysis, type HumPitch, type PipelineSpec, type Recording } from '../api'
 import { useAction } from '../lib/hooks'
 import { Spectrogram } from './Spectrogram'
 
@@ -19,6 +19,23 @@ export function AnalysisView({
   const audio = useRef<HTMLAudioElement>(null)
   const { busy, error, run } = useAction()
   const key = typeof pipeline === 'object' ? JSON.stringify(pipeline) : pipeline
+  // hum recordings: overlay the offline pYIN pitch labels (what a hum head would train on)
+  const [hum, setHum] = useState<HumPitch | null>(null)
+  const humAction = useAction()
+  useEffect(() => {
+    setHum(null)
+    if (recording.label !== 'hum') return
+    let stale = false
+    humAction.run(() => api.humPitch(recording.id)).then((h) => !stale && h && setHum(h))
+    return () => {
+      stale = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recording.id, recording.label])
+  const humTrack = useMemo(
+    () => (hum ? hum.f0.map((hz, i) => [i / hum.rate, hz] as [number, number]) : undefined),
+    [hum],
+  )
 
   useEffect(() => {
     setRes(null)
@@ -99,6 +116,24 @@ export function AnalysisView({
         </div>
         {render.error && <span className="error small">{render.error}</span>}
       </div>
+      {recording.label === 'hum' && (
+        <div className="small" title="Offline pYIN pitch labels (dashed green on the transform spectrogram). Harmonic levels are relative to the strongest harmonic in each frame.">
+          <b>Hum pitch (pYIN)</b>{' '}
+          {humAction.busy && <span className="muted">labelling…</span>}
+          {humAction.error && <span className="error">{humAction.error}</span>}
+          {hum && (
+            <span className="muted">
+              {(hum.voiced_fraction * 100).toFixed(0)}% voiced
+              {hum.f0_median !== undefined &&
+                ` · ${hum.f0_p5!.toFixed(0)}–${hum.f0_p95!.toFixed(0)} Hz (median ${hum.f0_median.toFixed(0)})`}
+              {' · harmonics h1…: '}
+              {hum.harmonics_db.map((d) => (d === null ? '·' : d.toFixed(0))).join(' ')} dB
+              {hum.f0_p5 !== undefined && res && hum.f0_p5 < res.raw_axis.freqs[0] &&
+                ` · fundamental is below this transform's ${res.raw_axis.freqs[0].toFixed(0)} Hz floor`}
+            </span>
+          )}
+        </div>
+      )}
       {busy && <div className="muted">analysing…</div>}
       {error && <div className="error">{error}</div>}
       {res && raw && filt && (
@@ -113,6 +148,7 @@ export function AnalysisView({
             freqs={res.raw_axis.freqs}
             times={res.raw.times}
             segments={recording.segments}
+            pitch={humTrack}
             playhead={playhead}
             onSeek={seek}
           />
@@ -131,6 +167,7 @@ export function AnalysisView({
             times={res.filtered.times}
             events={res.events}
             scores={res.scores}
+            kindScores={res.kind_scores}
             playhead={playhead}
             onSeek={seek}
           />
@@ -141,6 +178,7 @@ export function AnalysisView({
               {res.matches.map((m, i) => (
                 <div key={i} className="match">
                   <b>{m.tune_name}</b> at {m.time.toFixed(2)}s · score {m.score.toFixed(2)}
+                  {m.kind && m.kind !== 'whistle' ? ` · ${m.kind}` : ''}
                 </div>
               ))}
             </div>
@@ -149,6 +187,7 @@ export function AnalysisView({
               <table className="small">
                 <thead>
                   <tr>
+                    <th>kind</th>
                     <th>start</th>
                     <th>dur</th>
                     <th>median Hz</th>
@@ -160,6 +199,7 @@ export function AnalysisView({
                     const hz = e.contour.map((c) => c[1]).sort((a, b) => a - b)
                     return (
                       <tr key={i} onClick={() => seek(e.start - 0.2)} className="clickable">
+                        <td className={`kind-${e.kind ?? 'whistle'}-text`}>{e.kind ?? 'whistle'}</td>
                         <td>{e.start.toFixed(2)}</td>
                         <td>{(e.end - e.start).toFixed(2)}</td>
                         <td>{hz[Math.floor(hz.length / 2)].toFixed(0)}</td>

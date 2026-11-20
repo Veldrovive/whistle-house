@@ -12,7 +12,8 @@ where data came from::
 ``ClipEntry.label`` decides how training uses a clip:
 
 * ``whistle``                     -> positive (pitch auto-labelled, like mic whistle clips)
-* ``hum``                         -> hard negative (tonal, pitched, *not* whistling)
+* ``hum``                         -> positive for a model with a ``hum`` class (pYIN-labelled);
+                                     hard negative for a whistle-only model
 * ``speech`` / ``music`` / ``noise`` -> interferers / negatives
 """
 

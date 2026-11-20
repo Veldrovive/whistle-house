@@ -78,6 +78,9 @@ class TrainBody(BaseModel):
     external: list[str] = Field(default_factory=list)  # external dataset names
     init_from: str | None = None  # model name to fine-tune from
     workers: int = 2
+    val_examples: int = 64  # size of the fixed validation set
+    patience: int = 0  # stop after N validations without a better val F1 (0 = never)
+    arch: str = "small"  # ml/model.ARCHS; ignored when fine-tuning (init_from)
 
 
 class NoiseProfileBody(BaseModel):
@@ -280,6 +283,34 @@ def create_app(
             raise HTTPException(404)
         return FileResponse(p, media_type="audio/wav")
 
+    @app.get("/api/recordings/{rec_id}/hum-pitch")
+    async def hum_pitch(rec_id: str):
+        """pYIN pitch track (offline hum labeller, cached) + harmonic profile of a recording."""
+        if not S.recordings.audio_path(rec_id).exists():
+            raise HTTPException(404, f"recording {rec_id} not found")
+        try:
+            from whistle_house.data import hum_labels as hl
+        except ImportError as e:  # pragma: no cover - depends on installed extras
+            raise HTTPException(501, f"needs the ml extra (librosa): {e}") from e
+
+        def work() -> dict:
+            import numpy as np
+
+            f0 = hl.ensure_hum_labels(S.recordings, S.paths.label_cache, [rec_id])[rec_id]
+            audio, sr = S.recordings.load(rec_id)
+            h = hl.harmonic_levels(to_mono_float(audio), sr, f0)
+            return {
+                "rate": hl.LABEL_RATE,
+                "f0": [round(float(v), 1) for v in f0],
+                "harmonics_db": [None if np.isnan(v) else round(float(v), 1) for v in h],
+                **hl.summarize(f0),
+            }
+
+        try:
+            return await asyncio.to_thread(work)
+        except ImportError as e:
+            raise HTTPException(501, f"needs the ml extra (librosa): {e}") from e
+
     @app.patch("/api/recordings/{rec_id}")
     def update_recording(rec_id: str, upd: RecordingUpdate) -> Recording:
         return S.recordings.update(rec_id, upd)
@@ -362,6 +393,7 @@ def create_app(
             "raw": encode_block(res.raw),
             "filtered": encode_block(res.filtered),
             "scores": res.scores.tolist(),
+            "kind_scores": {k: v.tolist() for k, v in res.kind_scores.items()},
             "events": [e.to_json() for e in res.events],
             "matches": [m.to_json() for m in res.matches],
         }
@@ -426,7 +458,14 @@ def create_app(
             instances, per_rec = [], {}
             for rid in rec_ids:
                 _, res = _analyze(spec, rid)
-                groups = split_by_silence(res.events, body.split_gap_s)
+                # a tune instance is whistled or hummed, never a mix of the two
+                groups = [
+                    g
+                    for kind in sorted({e.kind for e in res.events})
+                    for g in split_by_silence(
+                        [e for e in res.events if e.kind == kind], body.split_gap_s
+                    )
+                ]
                 per_rec[rid] = [len(g) for g in groups]
                 instances += groups
             return fit_note_template(instances), per_rec
@@ -539,6 +578,12 @@ def create_app(
             body.mix,
             "--workers",
             str(body.workers),
+            "--val-examples",
+            str(body.val_examples),
+            "--patience",
+            str(body.patience),
+            "--arch",
+            body.arch,
         ]
         if body.external:
             cmd += ["--external", ",".join(body.external)]

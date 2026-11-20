@@ -207,6 +207,7 @@ class LiveEngine:
         raw_blocks: list[FrameBlock] = []
         filt_blocks: list[FrameBlock] = []
         scores: list[np.ndarray] = []
+        kind_scores: dict[str, list[np.ndarray]] = {}
         events: list[dict] = []
         active: list[dict] = []
         assert self._source is not None
@@ -230,6 +231,8 @@ class LiveEngine:
                 filt_blocks.append(r.filtered)
                 fs = r.detection.frame_scores
                 scores.append(fs if fs is not None else np.zeros(r.filtered.n_frames, np.float32))
+                for kind, ks in (r.detection.kind_scores or {}).items():
+                    kind_scores.setdefault(kind, []).append(ks)
                 events += [e.to_json() for e in r.detection.events]
                 active = [e.to_json() for e in r.detection.active]
                 for m in r.matches:
@@ -244,6 +247,9 @@ class LiveEngine:
                             ),
                             "filtered": encode_block(FrameBlock.concat(filt_blocks, pipeline.axis)),
                             "scores": np.concatenate(scores).tolist(),
+                            "kind_scores": {
+                                k: np.concatenate(v).tolist() for k, v in kind_scores.items()
+                            },
                             "events": events,
                             "active": active,
                             "now": pipeline.now,
@@ -251,6 +257,7 @@ class LiveEngine:
                     )
                 if now - last_pub >= self.PUBLISH_INTERVAL_S:
                     raw_blocks, filt_blocks, scores, events = [], [], [], []
+                    kind_scores = {}
                     last_pub = now
         except Exception as e:
             log.exception("live engine crashed")

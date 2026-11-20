@@ -137,6 +137,7 @@ class AnalysisResult:
     scores: np.ndarray
     events: list[WhistleEvent] = field(default_factory=list)
     matches: list[TuneMatch] = field(default_factory=list)
+    kind_scores: dict[str, np.ndarray] = field(default_factory=dict)  # per-kind frame scores
 
 
 class Pipeline:
@@ -185,6 +186,7 @@ class Pipeline:
         """Run a whole recording through the streaming path from a fresh state."""
         self.reset()
         raws, filts, scores, events, matches = [], [], [], [], []
+        kind_scores: dict[str, list[np.ndarray]] = {}
         cs = self.spec.chunk_size
         for i in range(0, len(samples), cs):
             r = self.step(samples[i : i + cs])
@@ -192,6 +194,8 @@ class Pipeline:
             filts.append(r.filtered)
             s = r.detection.frame_scores
             scores.append(s if s is not None else np.zeros(r.filtered.n_frames, np.float32))
+            for kind, ks in (r.detection.kind_scores or {}).items():
+                kind_scores.setdefault(kind, []).append(ks)
             events += r.detection.events
             matches += r.matches
         ev, m = self.flush()
@@ -203,6 +207,7 @@ class Pipeline:
             np.concatenate(scores) if scores else np.zeros(0, np.float32),
             events,
             matches,
+            {k: np.concatenate(v) for k, v in kind_scores.items()},
         )
 
 

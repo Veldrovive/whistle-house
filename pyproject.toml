@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Learned whistle detector training + inference.
-ml = ["torch>=2.5"]
+# Learned whistle detector training + inference, and offline hum pitch labelling.
+ml = ["torch>=2.5", "librosa>=0.10"]  # librosa: pYIN hum pitch labels
 
 [project.scripts]
 whistle-house = "whistle_house.cli:main"

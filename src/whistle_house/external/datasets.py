@@ -92,7 +92,7 @@ class MLEndWhistles(_MLEnd):
 @register_dataset
 class MLEndHums(_MLEnd):
     name = "mlend_hums"
-    description = "MLEnd: 4810 hummed melodies (hard negatives: tonal but not whistling)"
+    description = "MLEnd: 4810 hummed melodies (hum positives; negatives for whistle-only)"
     download_size = "~12.5 GB"
     interpretation = "Hum"
 

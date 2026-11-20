@@ -6,6 +6,7 @@ import { LABELS } from '../lib/labels'
 
 const HINTS: Record<string, string> = {
   whistle: 'Clean whistling, quiet room. These become positives (pitch auto-labelled).',
+  hum: 'Clean humming, quiet room. Collected to study hums; for now the whistle detector treats them as hard negatives.',
   speech: 'Talk normally, no whistling. The #1 false-trigger in v1 — collect lots.',
   noise: 'TV, kitchen, doors, typing… anything that is not whistling.',
   music: 'Music playing in the room.',

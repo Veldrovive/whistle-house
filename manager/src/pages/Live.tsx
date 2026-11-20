@@ -5,6 +5,7 @@ import {
   type Axis,
   type EngineStatus,
   type EventJson,
+  type KindScores,
   type MatchJson,
   type PipelineSpec,
   type Tune,
@@ -46,6 +47,7 @@ export function Live() {
   const raw = useRef<Buf>({ rows: [], times: [] })
   const filt = useRef<Buf>({ rows: [], times: [] })
   const scores = useRef<number[]>([])
+  const kindScores = useRef<KindScores>({})
   const events = useRef<EventJson[]>([])
   const active = useRef<EventJson[]>([])
 
@@ -73,11 +75,17 @@ export function Live() {
           raw.current = { rows: [], times: [] }
           filt.current = { rows: [], times: [] }
           scores.current = []
+          kindScores.current = {}
           events.current = []
         } else if (msg.type === 'frames') {
           append(raw.current, decodeBlock(msg.raw), msg.raw.n_frames, msg.raw.n_bins, msg.raw.times)
           append(filt.current, decodeBlock(msg.filtered), msg.filtered.n_frames, msg.filtered.n_bins, msg.filtered.times)
           scores.current = scores.current.concat(msg.scores).slice(-filt.current.times.length)
+          const ks: KindScores = {}
+          for (const [kind, s] of Object.entries((msg.kind_scores ?? {}) as KindScores)) {
+            ks[kind] = (kindScores.current[kind] ?? []).concat(s).slice(-filt.current.times.length)
+          }
+          kindScores.current = ks
           const t0 = filt.current.times[0] ?? 0
           events.current = events.current.concat(msg.events).filter((e) => e.end >= t0)
           active.current = msg.active
@@ -160,13 +168,16 @@ export function Live() {
           events={view === 'filtered' ? events.current : undefined}
           active={view === 'filtered' ? active.current : undefined}
           scores={view === 'filtered' ? scores.current : undefined}
+          kindScores={view === 'filtered' ? kindScores.current : undefined}
           height={300}
         />
       ) : (
         <div className="spec empty">waiting for audio…</div>
       )}
       <div className="muted small">
-        Blue lines: finished whistle events · dashed: in progress · green trace: detector score.
+        Lines: finished notes (<span className="kind-whistle-text">whistled</span>,{' '}
+        <span className="kind-hum-text">hummed</span>) · dashed: in progress · trace along the bottom: detector
+        score (one per kind, in its colour, for detectors that tell them apart).
       </div>
 
       <h3>Collect data</h3>
@@ -177,6 +188,7 @@ export function Live() {
       {matches.map((m, i) => (
         <div key={i} className="match">
           <b>{m.tune_name}</b> · score {m.score.toFixed(2)}
+          {m.kind && m.kind !== 'whistle' ? ` · ${m.kind}` : ''}
           {m.wall_time && <span className="muted"> · {new Date(m.wall_time * 1000).toLocaleTimeString()}</span>}
         </div>
       ))}

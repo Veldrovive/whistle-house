@@ -91,15 +91,32 @@ export type EventJson = {
   confidence: number
   contour: [number, number, number][]
   meta: Record<string, unknown>
+  /** how the note was made: 'whistle' or 'hum' (absent in old data = whistle) */
+  kind?: string
 }
+/** Per-kind detector scores per frame, from detectors that tell kinds apart (learned). */
+export type KindScores = Record<string, number[]>
 export type MatchJson = {
   tune_id: string
   tune_name: string
   time: number
   score: number
+  /** whether the tune was whistled or hummed */
+  kind?: string
   events: EventJson[]
   wall_time?: number
 }
+/** pYIN pitch track of a recording (offline hum labeller); f0 = 0 where unvoiced. */
+export type HumPitch = {
+  rate: number
+  f0: number[]
+  harmonics_db: (number | null)[]
+  voiced_fraction: number
+  f0_median?: number
+  f0_p5?: number
+  f0_p95?: number
+}
+
 export type Analysis = {
   pipeline: PipelineSpec
   raw_axis: Axis
@@ -107,6 +124,7 @@ export type Analysis = {
   raw: EncodedBlock
   filtered: EncodedBlock
   scores: number[]
+  kind_scores?: KindScores
   events: EventJson[]
   matches: MatchJson[]
 }
@@ -127,8 +145,14 @@ export type ModelStatus = {
   state: 'preparing' | 'training' | 'done' | 'failed'
   pipeline: string
   config: Record<string, number | string>
-  history: Record<string, number>[]
-  best?: Record<string, number>
+  // One entry per validation (epoch). Fine-tunes start with epoch 0 = the init checkpoint
+  // (loss null). mic_train_* / mic_val_* / overfit_gap appear when mic whistle clips are used.
+  // Models with several classes add <class>_<metric> (whistle_f1, hum_f1, ...); the plain
+  // names are then the mean over classes.
+  history: Record<string, number | null>[]
+  classes?: string[] // what the model detects: ['whistle'] or ['whistle', 'hum']
+  best?: Record<string, number | null>
+  stopped_early?: number // epoch at which `patience` ended the run
   data?: Record<string, Record<string, number>> // {train: {...counts}, val: {...counts}}
   init_from?: string
   error?: string
@@ -241,6 +265,7 @@ export const api = {
       typeof pipeline === 'object' ? { recording_id, spec: pipeline } : { recording_id, pipeline },
       'blob',
     ),
+  humPitch: (id: string) => req<HumPitch>('GET', `/api/recordings/${id}/hum-pitch`),
   analyze: (recording_id: string, pipeline?: string | PipelineSpec) =>
     req<Analysis>(
       'POST',
@@ -278,6 +303,9 @@ export const api = {
     external: string[]
     init_from?: string
     workers: number
+    val_examples: number
+    patience: number
+    arch: string
   }) => req('POST', '/api/models/train', body),
   datasets: () => req<DatasetsInfo>('GET', '/api/datasets'),
 

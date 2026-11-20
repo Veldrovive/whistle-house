@@ -42,12 +42,15 @@ def cmd_analyze(args) -> None:
     pipe = Pipeline(spec, tunes=TuneLibrary(paths.tunes), data_dir=paths.root)
     audio, _ = load_audio(args.file, spec.sample_rate)
     res = pipe.analyze(audio)
-    print(f"{len(res.events)} whistle events")
+    print(f"{len(res.events)} events")
     for e in res.events:
-        print(f"  {e.start:7.2f}-{e.end:7.2f}s  {e.median_hz():7.1f} Hz  conf={e.confidence:.2f}")
+        print(
+            f"  {e.start:7.2f}-{e.end:7.2f}s  {e.kind:8s} {e.median_hz():7.1f} Hz  "
+            f"conf={e.confidence:.2f}"
+        )
     print(f"{len(res.matches)} tune matches")
     for m in res.matches:
-        print(f"  {m.time:7.2f}s  {m.tune_name}  score={m.score:.2f}")
+        print(f"  {m.time:7.2f}s  {m.tune_name} ({m.kind})  score={m.score:.2f}")
 
 
 def cmd_import(args) -> None:
@@ -77,6 +80,11 @@ def _external_list(value: str | None) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _classes(value: str | None) -> list[str]:
+    """'whistle,hum' -> ['whistle', 'hum']; None/'' -> [] (the arch's own classes)."""
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
 def _train_config(args, **overrides):
     from whistle_house.ml.train import TrainConfig
 
@@ -89,6 +97,10 @@ def _train_config(args, **overrides):
             "seed": args.seed,
             "device": args.device,
             "workers": args.workers,
+            "val_examples": args.val_examples,
+            "patience": args.patience,
+            "arch": args.arch,
+            "classes": _classes(args.classes),
             **overrides,
         }
     )
@@ -158,7 +170,7 @@ def cmd_datasets_fetch(args) -> None:
 def cmd_datasets_labels(args) -> None:
     """Pre-compute pitch auto-labels (otherwise done at the start of training)."""
     from whistle_house.data.store import RecordingStore
-    from whistle_house.data.training import collect_sources
+    from whistle_house.data.training import GeneratorConfig, collect_sources
     from whistle_house.pipeline import PipelineStore
     from whistle_house.settings import external_root
 
@@ -173,7 +185,9 @@ def cmd_datasets_labels(args) -> None:
         external_root=external_root(required=bool(ext)),
         external_datasets=ext,
         noise_dirs=[paths.noise],
+        config=GeneratorConfig(classes=tuple(_classes(args.classes) or ["whistle"])),
         workers=args.workers,
+        data_dir=paths.root,
     )
     print(src.summary())
 
@@ -183,6 +197,7 @@ def cmd_warmstart(args) -> None:
     import shutil
 
     from whistle_house.data.store import RecordingStore
+    from whistle_house.ml.model import ARCHS
     from whistle_house.ml.train import train
     from whistle_house.pipeline import PipelineStore
 
@@ -198,20 +213,26 @@ def cmd_warmstart(args) -> None:
         spec,
         paths,
         pre_name,
-        _train_config(args, mix="pretrain", external=ext, epochs=args.pretrain_epochs),
+        _train_config(
+            args, mix="pretrain", external=ext, epochs=args.pretrain_epochs, patience=args.patience
+        ),
     )
 
-    has_mic = any(r.label == "whistle" for r in RecordingStore(paths.recordings).list())
+    classes = _classes(args.classes) or list(ARCHS[args.arch].get("classes", ("whistle",)))
+    has_mic = any(r.label in classes for r in RecordingStore(paths.recordings).list())
     if not has_mic:
         shutil.copy(paths.models / f"{pre_name}.pt", paths.models / f"{args.name}.pt")
         print(
-            f"\nNo mic whistle recordings in {paths.recordings}: skipped fine-tuning, saved the "
+            f"\nNo mic {'/'.join(classes)} recordings in {paths.recordings}: skipped fine-tuning, saved the "
             f"pretrained model as {args.name}.pt. Collect data on the Pi, copy data/ here and run "
             f"`whistle-house train-detector --mix finetune --init-from {pre_name} "
             f"--external all --name {args.name}`."
         )
         return
-    print(f"\n== fine-tuning {args.name} on mic recordings ({args.finetune_epochs} epochs)")
+    print(
+        f"\n== fine-tuning {args.name} on mic recordings (up to {args.finetune_epochs} epochs of "
+        f"{args.finetune_steps_per_epoch} steps, patience {args.finetune_patience})"
+    )
     train(
         spec,
         paths,
@@ -222,6 +243,8 @@ def cmd_warmstart(args) -> None:
             external=ext,
             init_from=pre_name,
             epochs=args.finetune_epochs,
+            steps_per_epoch=args.finetune_steps_per_epoch,
+            patience=args.finetune_patience,
             lr=args.lr / 4,
         ),
     )
@@ -283,6 +306,41 @@ def cmd_noise_delete(args) -> None:
     NoiseProfileStore(_paths(args).noise_profiles).delete(args.name)
 
 
+def cmd_hum_labels(args) -> None:
+    """pYIN pitch labels for hum recordings: voiced %, pitch range, harmonic profile."""
+    import numpy as np
+
+    from whistle_house.audio.io import to_mono_float
+    from whistle_house.data.hum_labels import ensure_hum_labels, harmonic_levels, summarize
+    from whistle_house.data.store import RecordingStore
+
+    paths = _paths(args)
+    store = RecordingStore(paths.recordings)
+    ids = args.recordings.split(",") if args.recordings else None
+    labels = ensure_hum_labels(store, paths.label_cache, ids, workers=args.workers)
+    if not labels:
+        raise SystemExit("no hum recordings (record some with label 'hum', or pass --recordings)")
+    print(
+        f"{'id':14s} {'split':5s} {'dur':>5s} {'voiced':>6s} {'f0 p5..p50..p95 (Hz)':>22s}  "
+        f"harmonics h1..h{args.harmonics} (dB vs strongest)"
+    )
+    for rid, f0 in labels.items():
+        rec = store.get(rid)
+        s = summarize(f0)
+        rng = (
+            f"{s['f0_p5']:5.0f}..{s['f0_median']:4.0f}..{s['f0_p95']:4.0f}"
+            if "f0_median" in s
+            else "-"
+        )
+        audio, sr = store.load(rid)
+        h = harmonic_levels(to_mono_float(audio), sr, f0, args.harmonics)
+        hs = " ".join("  ." if np.isnan(v) else f"{v:3.0f}" for v in h)
+        print(
+            f"{rid:14s} {rec.split:5s} {rec.duration:5.1f} {s['voiced_fraction']:6.0%} "
+            f"{rng:>22s}  {hs}"
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whistle-house")
     ap.add_argument("--data", help="data directory (default: $WHISTLE_HOUSE_DATA or ./data)")
@@ -311,7 +369,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tune", help="tune id (for tune examples)")
     p.set_defaults(fn=cmd_import)
 
-    def train_args(p, epochs=20, steps=100, batch=16):
+    def train_args(p, epochs=20, steps=100, batch=16, val=64):
         p.add_argument("--pipeline", default="default", help="pipeline whose front-end to train on")
         p.add_argument("--name", default="whistlenet")
         p.add_argument("--epochs", type=int, default=epochs)
@@ -321,8 +379,28 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
         p.add_argument("--workers", type=int, default=4, help="example-generation processes")
+        p.add_argument(
+            "--arch",
+            default="small",
+            help="model: small (whistle-only Pi model) | large (whistle-only reference model "
+            "with lookahead) | harmonic (whistles + hums; needs a log-frequency pipeline such "
+            "as stft_log). Ignored with --init-from, which keeps the checkpoint's architecture",
+        )
+        p.add_argument(
+            "--classes",
+            help="sounds to detect, comma list of whistle,hum (default: the arch's own)",
+        )
+        p.add_argument(
+            "--val-examples", type=int, default=val, help="size of the fixed validation set"
+        )
+        p.add_argument(
+            "--patience",
+            type=int,
+            default=0,
+            help="stop after this many validations (epochs) without a better val F1; 0 = never",
+        )
 
-    p = sub.add_parser("train-detector", help="train the learned whistle detector (needs ml extra)")
+    p = sub.add_parser("train-detector", help="train the learned detector (needs ml extra)")
     train_args(p)
     p.add_argument("--mix", default="mic", help="data mix preset: mic | pretrain | finetune")
     p.add_argument("--external", help="external datasets to use: 'all' or comma list")
@@ -342,17 +420,33 @@ def main(argv: list[str] | None = None) -> None:
     q = dsub.add_parser("labels", help="pre-compute pitch auto-labels for a pipeline's front-end")
     q.add_argument("--pipeline", default="default")
     q.add_argument("--external", default="all")
+    q.add_argument(
+        "--classes",
+        help="comma list of whistle,hum: with hum, also pYIN-label the hum clips "
+        "(default: whistle)",
+    )
     q.add_argument("--workers", type=int, default=8)
     q.set_defaults(fn=cmd_datasets_labels)
 
     p = sub.add_parser("warmstart", help="fetch datasets, pretrain on them, fine-tune on mic data")
-    train_args(p, epochs=0, steps=500, batch=32)
+    train_args(p, epochs=0, steps=500, batch=32, val=256)
     p.add_argument("--datasets", default="all", help="'all' or comma list of dataset names")
     p.add_argument("--skip-fetch", action="store_true", help="datasets are already prepared")
     p.add_argument("--clean-raw", action="store_true")
     p.add_argument("--allow-pi", action="store_true")
     p.add_argument("--pretrain-epochs", type=int, default=40)
-    p.add_argument("--finetune-epochs", type=int, default=15)
+    p.add_argument(
+        "--finetune-epochs", type=int, default=60, help="max epochs; --patience usually ends it"
+    )
+    p.add_argument(
+        "--finetune-steps-per-epoch",
+        type=int,
+        default=50,
+        help="short epochs = frequent validation, to catch where overfitting starts",
+    )
+    p.add_argument(
+        "--finetune-patience", type=int, default=15, help="--patience for the fine-tune stage"
+    )
     p.set_defaults(fn=cmd_warmstart)
 
     p = sub.add_parser("noise-profile", help="noise profiles for the spectral_gate filter")
@@ -375,6 +469,12 @@ def main(argv: list[str] | None = None) -> None:
     q = nsub.add_parser("delete", help="delete a noise profile")
     q.add_argument("name")
     q.set_defaults(fn=cmd_noise_delete)
+
+    p = sub.add_parser("hum-labels", help="pYIN pitch labels for hum recordings (needs ml extra)")
+    p.add_argument("--recordings", help="comma-separated recording ids (default: every 'hum')")
+    p.add_argument("--harmonics", type=int, default=8, help="harmonics to profile")
+    p.add_argument("--workers", type=int, default=1)
+    p.set_defaults(fn=cmd_hum_labels)
 
     args = ap.parse_args(argv)
     logging.basicConfig(

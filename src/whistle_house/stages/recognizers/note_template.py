@@ -1,4 +1,9 @@
-"""Match the most recent whistle events against fitted per-note tune templates."""
+"""Match the most recent note events against fitted per-note tune templates.
+
+Templates are key- and tempo-invariant, so a tune fitted from whistled examples also matches
+when it is hummed a few octaves lower. Whistled and hummed notes are kept apart: a tune is
+matched within one kind, and the match says which (``TuneMatch.kind``).
+"""
 
 from __future__ import annotations
 
@@ -47,38 +52,42 @@ class NoteTemplateRecognizer(TuneRecognizer):
         self.reset()
 
     def reset(self) -> None:
-        self._recent: list[WhistleEvent] = []
+        self._recent: dict[str, list[WhistleEvent]] = {}  # per event kind (whistle, hum)
         self._last_fired: dict[str, float] = {}
 
     def process(self, events: list[WhistleEvent], now: float) -> list[TuneMatch]:
         if not events or self.ctx.tunes is None:
             return []
         c = self.config
-        self._recent = sorted(self._recent + events, key=lambda e: e.start)
-        # Keep only the run of events connected by short gaps to the newest one.
-        run = [self._recent[-1]]
-        for ev in reversed(self._recent[:-1]):
-            if run[0].start - ev.end > c.max_note_gap_s:
-                break
-            run.insert(0, ev)
-        self._recent = run[-32:]
-
         matches = []
-        for tune in self.ctx.tunes.list():
-            if not tune.enabled or tune.template is None:
-                continue
-            n = len(tune.template.notes)
-            if len(self._recent) < n:
-                continue
-            if now - self._last_fired.get(tune.id, -1e9) < c.cooldown_s:
-                continue
-            cand = self._recent[-n:]
-            score = score_instance(tune, cand, c.tolerance)
-            if score >= (tune.threshold if tune.threshold is not None else c.threshold):
-                matches.append(TuneMatch(tune.id, tune.name, now, score, cand))
+        for kind in sorted({e.kind for e in events}):
+            recent = sorted(
+                self._recent.get(kind, []) + [e for e in events if e.kind == kind],
+                key=lambda e: e.start,
+            )
+            # Keep only the run of events connected by short gaps to the newest one.
+            run = [recent[-1]]
+            for ev in reversed(recent[:-1]):
+                if run[0].start - ev.end > c.max_note_gap_s:
+                    break
+                run.insert(0, ev)
+            recent = self._recent[kind] = run[-32:]
+
+            for tune in self.ctx.tunes.list():
+                if not tune.enabled or tune.template is None:
+                    continue
+                n = len(tune.template.notes)
+                if len(recent) < n:
+                    continue
+                if now - self._last_fired.get(tune.id, -1e9) < c.cooldown_s:
+                    continue
+                cand = recent[-n:]
+                score = score_instance(tune, cand, c.tolerance)
+                if score >= (tune.threshold if tune.threshold is not None else c.threshold):
+                    matches.append(TuneMatch(tune.id, tune.name, now, score, cand, kind))
         if matches:
             best = max(matches, key=lambda m: m.score)
             self._last_fired[best.tune_id] = now
-            self._recent = []  # consume: don't let these notes also start another match
+            self._recent[best.kind] = []  # consume: these notes must not start another match
             return [best]
         return []

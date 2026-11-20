@@ -24,6 +24,32 @@ def refine_peak(values: np.ndarray, idx: int) -> float:
     return float(idx + 0.5 * (a - c) / denom)
 
 
+def drop_harmonics(
+    peaks: list[tuple[float, float]], tolerance_semitones: float = 0.5, max_harmonic: int = 5
+) -> list[bool]:
+    """Which spectral peaks of one frame are fundamentals (True) rather than harmonics (False).
+
+    ``peaks`` is ``(hz, level)`` for every prominent peak in the frame. A peak is a harmonic
+    when another peak sits at its frequency divided by 2..``max_harmonic`` (within the
+    tolerance) and is at least as loud: a whistle's overtones are far weaker than its
+    fundamental, so the quieter upper peak is the overtone. A louder upper peak is kept (it is
+    a sound of its own, not an overtone of the quiet one below).
+    """
+    keep = []
+    for hz, level in peaks:
+        harmonic = any(
+            lo_level >= level
+            and any(
+                abs(semitones(hz, k * lo_hz)) <= tolerance_semitones
+                for k in range(2, max_harmonic + 1)
+            )
+            for lo_hz, lo_level in peaks
+            if lo_hz < hz
+        )
+        keep.append(not harmonic)
+    return keep
+
+
 @dataclass
 class _Track:
     points: list[ContourPoint] = field(default_factory=list)
@@ -49,7 +75,9 @@ class ContourTracker:
         max_gap_frames: int = 3,
         min_duration_s: float = 0.08,
         min_points_active: int = 3,
+        kind: str = "whistle",
     ):
+        self.kind = kind  # stamped on the events this tracker produces
         self.max_jump = max_jump_semitones
         self.max_gap = max_gap_frames
         self.min_duration = min_duration_s
@@ -68,6 +96,7 @@ class ContourTracker:
             end=tr.points[-1].t,
             contour=list(tr.points),
             confidence=float(np.mean(strengths)),
+            kind=self.kind,
         )
 
     def step(self, t: float, candidates: list[tuple[float, float]]) -> list[WhistleEvent]:
@@ -112,7 +141,7 @@ class ContourTracker:
 
     def active(self) -> list[WhistleEvent]:
         return [
-            WhistleEvent(tr.points[0].t, tr.points[-1].t, list(tr.points))
+            WhistleEvent(tr.points[0].t, tr.points[-1].t, list(tr.points), kind=self.kind)
             for tr in self.tracks
             if len(tr.points) >= self.min_points_active
         ]

@@ -208,3 +208,66 @@ class LinearSpectrogram(_StftTransform):
 
     def _project(self, power: np.ndarray) -> np.ndarray:
         return power[:, self._sel]
+
+
+def log_frequencies(fmin: float, fmax: float, bins_per_octave: int) -> np.ndarray:
+    """Geometrically spaced bin centres from fmin up to (at most) fmax."""
+    n = int(np.floor(bins_per_octave * np.log2(fmax / fmin) + 1e-9)) + 1
+    return fmin * 2.0 ** (np.arange(n) / bins_per_octave)
+
+
+def log_filterbank(
+    sr: int, n_fft: int, fmin: float, fmax: float, bins_per_octave: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """(n_bins, n_fft//2+1) peak-normalised triangles on a log-frequency axis, + bin centres.
+
+    Each triangle reaches from the previous bin centre to the next one, but never narrower
+    than one FFT bin either side. So where log bins are narrower than FFT bins (low end) a bin
+    is the linear interpolation of the FFT power at its centre; where they are wider (high end)
+    it sums the FFT bins it covers. Peak weight 1 keeps a pure tone at the same level on every
+    bin it lands on (the broadband floor rises with bin width instead).
+    """
+    centres = log_frequencies(fmin, fmax, bins_per_octave)
+    fft_freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    df = sr / n_fft
+    ratio = 2.0 ** (1.0 / bins_per_octave)
+    lo_w = np.maximum(centres - centres / ratio, df)
+    hi_w = np.maximum(centres * ratio - centres, df)
+    d = fft_freqs[None, :] - centres[:, None]
+    w = np.maximum(0.0, np.minimum(1 + d / lo_w[:, None], 1 - d / hi_w[:, None]))
+    return w.astype(np.float32), centres
+
+
+@register
+class LogSpectrogram(_StftTransform):
+    """STFT -> log-frequency (semitone-spaced) bins -> dB. Covers hums and whistles.
+
+    The defaults reach down to 60 Hz so a hum's fundamental (the harmonic that carries its
+    pitch) is on the axis, and use a 4096-sample window so ~100 Hz notes are resolved. Every
+    harmonic of a note sits a fixed number of bins above the fundamental (h2 = +1 octave,
+    h3 = +19 semitones, ...), whatever the pitch: a convolutional model can learn the harmonic
+    pattern once and reuse it at every pitch.
+    """
+
+    name = "stft_log"
+
+    class Config(_StftConfig):
+        n_fft: int = Field(4096, description="FFT window length in samples")
+        fmin: float = Field(60.0, description="Lowest bin centre (Hz)")
+        bins_per_octave: int = Field(24, description="Bins per octave (24 = quarter tones)")
+
+    def __init__(self, config: Config, ctx: StageContext):
+        super().__init__(config, ctx)
+        if config.fmin <= 0 or config.fmax <= config.fmin:
+            raise ValueError("need 0 < fmin < fmax")
+        self.basis, centres = log_filterbank(
+            ctx.sample_rate, config.n_fft, config.fmin, config.fmax, config.bins_per_octave
+        )
+        self._axis = FrequencyAxis(centres, "log")
+
+    @property
+    def axis(self) -> FrequencyAxis:
+        return self._axis
+
+    def _project(self, power: np.ndarray) -> np.ndarray:
+        return power @ self.basis.T

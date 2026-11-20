@@ -99,7 +99,7 @@ def test_example_generator_shapes(tmp_path):
     assert (src.mic_positives[0].f0 > 0).mean() > 0.3  # auto-labels found the whistling
     gen = ExampleGenerator(fe, src, cfg)
     x, f0 = gen.batch(np.random.default_rng(0), 4)
-    assert x.shape[0] == 4 and x.shape[2] == 128 and f0.shape == x.shape[:2]
+    assert x.shape[0] == 4 and x.shape[2] == 128 and f0.shape == (*x.shape[:2], 1)
 
 
 def test_pipeline_store_default(tmp_path):

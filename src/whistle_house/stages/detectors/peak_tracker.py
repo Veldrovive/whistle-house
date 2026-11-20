@@ -2,6 +2,11 @@
 
 Not expected to reject speech well - it is the baseline to beat, and is used to auto-label
 pitch contours in clean whistle recordings for training the learned detector.
+
+Every prominent peak becomes a candidate, so a whistle with visible overtones gives a second
+(and third) contour at 2x / 3x its pitch. ``reject_harmonics`` drops those per frame (see
+``common.drop_harmonics``). It is off by default so existing pipelines behave as before; the
+auto-labeller turns it on.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ from pydantic import Field
 from scipy.signal import find_peaks
 
 from whistle_house.stages.base import StageConfig, StageContext, WhistleDetector, register
-from whistle_house.stages.detectors.common import ContourTracker, refine_peak
+from whistle_house.stages.detectors.common import ContourTracker, drop_harmonics, refine_peak
 from whistle_house.types import DetectorOutput, FrameBlock, WhistleEvent
 
 
@@ -37,6 +42,14 @@ class PeakTracker(WhistleDetector):
             description="Treat frames with more than this many qualifying peaks as non-tonal "
             "(speech/noise) and drop them. 0 disables.",
         )
+        reject_harmonics: bool = Field(
+            False,
+            description="Drop a peak when a peak at least as loud sits at 1/2, 1/3, 1/4 or 1/5 "
+            "of its frequency: it is an overtone of that note, not a note of its own",
+        )
+        harmonic_tolerance_semitones: float = Field(
+            0.5, description="How far from an exact multiple a peak may be and still be an overtone"
+        )
 
     def __init__(self, config: Config, ctx: StageContext):
         super().__init__(config, ctx)
@@ -54,10 +67,20 @@ class PeakTracker(WhistleDetector):
         scores = np.zeros(block.n_frames, np.float32)
         for i, (t, frame) in enumerate(zip(block.times, block.values, strict=True)):
             peaks, props = find_peaks(frame, prominence=c.min_prominence, width=c.min_width_bins)
+            hzs = [axis.bin_to_hz(refine_peak(frame, int(p))) for p in peaks]
+            # Overtones are judged against every prominent peak, including fundamentals
+            # outside [min_hz, max_hz].
+            keep = (
+                drop_harmonics(
+                    [(hz, float(frame[p])) for hz, p in zip(hzs, peaks, strict=True)],
+                    c.harmonic_tolerance_semitones,
+                )
+                if c.reject_harmonics
+                else [True] * len(hzs)
+            )
             cands = []
-            for p, prom in zip(peaks, props["prominences"], strict=True):
-                hz = axis.bin_to_hz(refine_peak(frame, int(p)))
-                if c.min_hz <= hz <= c.max_hz:
+            for hz, prom, ok in zip(hzs, props["prominences"], keep, strict=True):
+                if ok and c.min_hz <= hz <= c.max_hz:
                     cands.append((hz, float(prom)))
             if c.max_strong_peaks and len(cands) > c.max_strong_peaks:
                 cands = []

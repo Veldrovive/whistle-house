@@ -107,6 +107,7 @@ class HomeAssistantEvent(Output):
             "tune_id": match.tune_id,
             "tune": match.tune_name,
             "score": match.score,
+            "kind": match.kind,  # whistle | hum
             **c.extra_data,
         }
         r = httpx.post(

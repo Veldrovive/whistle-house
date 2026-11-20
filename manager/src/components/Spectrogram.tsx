@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
-import type { EventJson } from '../api'
+import type { EventJson, KindScores } from '../api'
 
 // Inferno-ish colormap built from a few stops.
 const STOPS: [number, [number, number, number]][] = [
@@ -49,7 +49,11 @@ export type SpectrogramProps = {
   times: number[] // frame centre times
   events?: EventJson[]
   active?: EventJson[]
+  /** reference pitch track (e.g. pYIN hum labels): [time s, Hz] points, Hz 0 = gap */
+  pitch?: [number, number][]
   scores?: number[]
+  /** per-kind score traces (whistle, hum); drawn instead of `scores` when present */
+  kindScores?: KindScores
   segments?: { start: number; end: number; label: string }[]
   playhead?: number | null
   vmin?: number
@@ -93,11 +97,25 @@ export function Spectrogram(p: SpectrogramProps) {
   const h = p.height ?? 220
   const x = (t: number) => ((t - t0) / span) * 1000
   const y = (hz: number) => (1 - hzToBin(hz, p.freqs) / (p.nBins - 1)) * 1000
-  const ticks = [500, 1000, 2000, 3000, 4000, 6000].filter(
+  const ticks = [100, 200, 500, 1000, 2000, 3000, 4000, 6000].filter(
     (f) => f >= p.freqs[0] && f <= p.freqs[p.freqs.length - 1],
   )
 
   const line = (e: EventJson) => e.contour.map(([t, hz]) => `${x(t)},${y(hz)}`).join(' ')
+  const kindClass = (e: EventJson) => `kind-${e.kind ?? 'whistle'}`
+  const trace = (s: number[]) => s.map((v, i) => `${x(p.times[i])},${1000 - v * 180}`).join(' ')
+  const kindTraces = Object.entries(p.kindScores ?? {}).filter(([, s]) => s.length === p.times.length)
+  // split the reference pitch track into voiced runs, one polyline each
+  const pitchRuns = useMemo(() => {
+    const lo = p.freqs[0]
+    const hi = p.freqs[p.freqs.length - 1]
+    const runs: [number, number][][] = [[]]
+    for (const pt of p.pitch ?? []) {
+      if (pt[1] >= lo && pt[1] <= hi) runs[runs.length - 1].push(pt)
+      else if (runs[runs.length - 1].length) runs.push([])
+    }
+    return runs.filter((r) => r.length > 1)
+  }, [p.pitch, p.freqs])
 
   return (
     <div
@@ -122,17 +140,24 @@ export function Spectrogram(p: SpectrogramProps) {
           />
         ))}
         {p.events?.map((e, i) => (
-          <polyline key={i} points={line(e)} className="ev" vectorEffect="non-scaling-stroke" />
+          <polyline key={i} points={line(e)} className={`ev ${kindClass(e)}`} vectorEffect="non-scaling-stroke" />
+        ))}
+        {pitchRuns.map((r, i) => (
+          <polyline
+            key={`p${i}`}
+            points={r.map(([t, hz]) => `${x(t)},${y(hz)}`).join(' ')}
+            className="pitch"
+            vectorEffect="non-scaling-stroke"
+          />
         ))}
         {p.active?.map((e, i) => (
-          <polyline key={`a${i}`} points={line(e)} className="ev active" vectorEffect="non-scaling-stroke" />
+          <polyline key={`a${i}`} points={line(e)} className={`ev active ${kindClass(e)}`} vectorEffect="non-scaling-stroke" />
         ))}
-        {p.scores && p.scores.length === p.times.length && (
-          <polyline
-            className="score"
-            vectorEffect="non-scaling-stroke"
-            points={p.scores.map((s, i) => `${x(p.times[i])},${1000 - s * 180}`).join(' ')}
-          />
+        {kindTraces.map(([kind, s]) => (
+          <polyline key={`s-${kind}`} className={`score kind-${kind}`} vectorEffect="non-scaling-stroke" points={trace(s)} />
+        ))}
+        {kindTraces.length === 0 && p.scores && p.scores.length === p.times.length && (
+          <polyline className="score" vectorEffect="non-scaling-stroke" points={trace(p.scores)} />
         )}
         {p.playhead != null && (
           <line x1={x(p.playhead)} x2={x(p.playhead)} y1={0} y2={1000} className="playhead" vectorEffect="non-scaling-stroke" />

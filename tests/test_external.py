@@ -185,6 +185,45 @@ def test_train_pretrain_then_finetune(tmp_path, monkeypatch):
     status = json.loads((paths.models / "ft.json").read_text())
     assert status["state"] == "done" and status["init_from"].endswith("pre.pt")
     assert (paths.models / "ft.pt").exists()
+    # Fine-tuning validates the starting checkpoint first (epoch 0) and probes the mic clips it
+    # trains on, so the manager can show where overfitting starts.
+    hist = status["history"]
+    assert [h["epoch"] for h in hist] == [0, 1] and hist[0]["loss"] is None
+    assert all("mic_train_f1" in h and "overfit_gap" in h for h in hist)
+    assert "mic_val_f1" not in hist[0]  # no held-out mic whistle clips in this store
+    assert status["best"]["f1"] >= hist[0]["f1"]  # never worse on val than the init checkpoint
+
+    # patience: a run stops 2 validations after its best one. The val F1 sequence is scripted
+    # (0.5 for the init checkpoint, then 0.6, 0.4, 0.3, ...) so this does not depend on what a
+    # few random training steps happen to do to the metrics.
+    import whistle_house.ml.train as train_mod
+
+    scripted, val_set = iter([0.5, 0.6, 0.4, 0.3, 0.2, 0.1, 0.05]), []
+
+    def fake_evaluate(model, x, f0, freqs, norm, dev):
+        val_set.append(id(x)) if not val_set else None  # the val set is evaluated first
+        f1 = next(scripted) if id(x) == val_set[0] else 0.9
+        return {"precision": f1, "recall": f1, "f1": f1, "false_positive_rate": 0.0}
+
+    with monkeypatch.context() as m:
+        m.setattr(train_mod, "_evaluate", fake_evaluate)
+        train(
+            spec,
+            paths,
+            "stop",
+            TrainConfig(
+                **{**small, "epochs": 6},
+                mix="finetune",
+                external=["mlend_whistles"],
+                init_from="pre",
+                workers=0,
+                patience=2,
+            ),
+        )
+    status = json.loads((paths.models / "stop.json").read_text())
+    assert status["state"] == "done" and status["best"]["epoch"] == 1
+    assert status["stopped_early"] == status["best"]["epoch"] + 2 < 6
+    assert len(status["history"]) == status["stopped_early"] + 1  # + the epoch-0 baseline
 
     other = PipelineSpec(transform={"name": "stft_mel", "params": {"n_mels": 64}})
     with pytest.raises(ValueError, match="different front-end"):
@@ -218,3 +257,18 @@ def test_download_many_skips_files_missing_upstream(tmp_path, monkeypatch):
     assert (tmp_path / "a.wav").read_bytes() == b"audio"
     assert (tmp_path / "b.wav").exists() and not (tmp_path / "gone.wav").exists()
     assert calls.count("http://x/gone.wav") == 1
+
+
+def test_mic_hum_recordings_are_hard_negatives(tmp_path):
+    """`hum` is a recording label; for the whistle detector those clips are interferers."""
+    from whistle_house.data.store import LABELS
+
+    assert "hum" in LABELS
+    paths = Paths(tmp_path / "data").ensure()
+    store = RecordingStore(paths.recordings)
+    rng = np.random.default_rng(0)
+    hum = store.add(synth_pseudo_speech(44100, 2.0, rng), 44100, label="hum", split="train")
+    store.add(synth_pseudo_speech(44100, 2.0, rng), 44100, label="speech", split="train")
+    src = collect_sources(FE, ("train",), store=store, label_cache_dir=paths.label_cache)
+    assert src.interferers["hum"] == [str(store.audio_path(hum.id))]
+    assert len(src.interferers["mic"]) == 1 and not src.mic_positives
