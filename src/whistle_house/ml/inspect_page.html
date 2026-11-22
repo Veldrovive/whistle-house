@@ -1,0 +1,660 @@
+<meta charset="utf-8">
+<title>HumNet Inspector</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* Layout: one long lab notebook column; the clip explorer is a stack of time-aligned strips with a frame inspector beside it. */
+:root {
+  --bg: #f5f6f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8984; --rule: #e1e2e0;
+  --hum: #2a78d6; --whistle: #eb6834; --speech: #1baf7a; --other: #a3a29c;
+  --div-neg: #2a78d6; --div-pos: #e34948; --div-mid: #f0efec;
+  --warn: #fab219; --crit: #d03b3b; --good: #0ca30c;
+  --f-display: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121312; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #8f8e86; --rule: #2e2f2d;
+  --hum: #3987e5; --whistle: #d95926; --speech: #199e70; --other: #6c6b66;
+  --div-neg: #3987e5; --div-pos: #e66767; --div-mid: #383835; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121312; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #8f8e86; --rule: #2e2f2d;
+  --hum: #3987e5; --whistle: #d95926; --speech: #199e70; --other: #6c6b66;
+  --div-neg: #3987e5; --div-pos: #e66767; --div-mid: #383835; color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--f-body); }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 40px; }
+h1, h2, h3 { font-family: var(--f-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: 34px; } h2 { font-size: 22px; } h3 { font-size: 15px; font-weight: 500; }
+p { margin: 0; max-width: 72ch; }
+.eyebrow { font: 500 12px var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+.muted { color: var(--ink-2); } .small { font-size: 13px; }
+.mono, .num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+section { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.card { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; min-width: 0; }
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.finding { display: flex; flex-direction: column; gap: 6px; }
+.finding .tag { display: inline-flex; align-items: center; gap: 6px; font: 500 12px var(--f-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+.finding .big { font: 600 26px var(--f-display); font-variant-numeric: tabular-nums; }
+.scroll-x { overflow-x: auto; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.sw.dash { background: repeating-linear-gradient(90deg, currentColor 0 4px, transparent 4px 7px) !important; height: 2px; }
+svg text { fill: var(--ink-2); font: 11px var(--f-mono); }
+svg .axis line, svg .axis path { stroke: var(--rule); }
+svg .grid line { stroke: var(--rule); stroke-dasharray: 2 3; }
+/* table */
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font: 500 11px var(--f-mono); text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); position: sticky; top: 0; background: var(--surface); }
+td:first-child, th:first-child, td.l, th.l { text-align: left; }
+tr.click { cursor: pointer; } tr.click:hover td { background: color-mix(in srgb, var(--hum) 7%, transparent); }
+tr.sel td { background: color-mix(in srgb, var(--hum) 13%, transparent); }
+tr.grp td { font: 600 12px var(--f-display); color: var(--ink); border-bottom: 1px solid var(--ink-3); padding-top: 14px; text-align: left; }
+.pill { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 12px; }
+.pill.bad { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--ink); }
+.pill.warn { background: color-mix(in srgb, var(--warn) 28%, transparent); color: var(--ink); }
+.pill.ok { color: var(--ink-2); }
+/* explorer */
+.explorer { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 980px) { .explorer { grid-template-columns: minmax(0, 1fr); } }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+select, button { font: 14px var(--f-body); color: var(--ink); background: var(--surface); border: 1px solid var(--rule); border-radius: 5px; padding: 5px 8px; }
+button { cursor: pointer; } button:hover { border-color: var(--ink-3); }
+:focus-visible { outline: 2px solid var(--hum); outline-offset: 2px; }
+.strips { display: flex; flex-direction: column; gap: 6px; }
+.strip { display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 8px; align-items: stretch; }
+.strip .lab { font-size: 12px; line-height: 1.3; color: var(--ink-2); display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+.strip .lab b { font-weight: 600; color: var(--ink); font-size: 12.5px; }
+.plot { position: relative; background: var(--surface); border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; cursor: crosshair; }
+.plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.plot svg.ov { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.plot .cur { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink); opacity: 0.55; pointer-events: none; }
+.plot .yt { position: absolute; left: 3px; font: 10px var(--f-mono); color: var(--ink-2); transform: translateY(-50%); pointer-events: none; text-shadow: 0 0 3px var(--surface), 0 0 3px var(--surface); }
+.tline { display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 8px; }
+.tline div { position: relative; height: 16px; font: 10px var(--f-mono); color: var(--ink-3); }
+#tline span, .faxis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.faxis { position: relative; height: 14px; font: 10px var(--f-mono); color: var(--ink-3); }
+.inspector { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 12px); display: flex; flex-direction: column; gap: 12px; }
+.readout { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+.readout dt { color: var(--ink-3); } .readout dd { margin: 0; font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--ink); border: 1px solid var(--rule); border-radius: 5px; padding: 6px 8px; font: 12px/1.4 var(--f-mono); box-shadow: 0 4px 14px rgba(0,0,0,.12); max-width: 280px; }
+.note { border-left: 3px solid var(--rule); padding-left: 12px; color: var(--ink-2); font-size: 14px; }
+.kbd { font: 12px var(--f-mono); border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header style="display:flex;flex-direction:column;gap:10px">
+    <div class="eyebrow" id="hdr-eyebrow">whistle-house · learned detector</div>
+    <h1>HumNet Inspector</h1>
+    <p class="muted" id="hdr-sub">Loading the checkpoint report…</p>
+  </header>
+
+  <section>
+    <h2>Headline numbers</h2>
+    <div class="findings" id="findings"></div>
+  </section>
+
+  <section>
+    <h2>The network</h2>
+    <p class="muted" id="netIntro"></p>
+    <div class="card scroll-x"><svg id="arch" viewBox="0 0 1180 300" style="min-width:900px;width:100%"></svg></div>
+  </section>
+
+  <section>
+    <h2>Clip explorer</h2>
+    <p class="muted">Pick a recording. All strips share the time axis. Move over any strip to inspect that frame on the right; click to pin it (click again to release). The reference pitch is the training labeller's: pYIN for hums, the strict <span class="mono">peak_tracker</span> for whistles.</p>
+    <div class="toolbar">
+      <label for="clipSel" class="small muted">Recording</label>
+      <select id="clipSel"></select>
+      <span class="small muted" id="clipMeta"></span>
+    </div>
+    <div class="explorer">
+      <div class="strips" id="strips"></div>
+      <aside class="inspector card" id="inspector">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+          <h3>Frame inspector</h3><span class="small muted" id="pinState">hover a strip</span>
+        </div>
+        <dl class="readout" id="readout"></dl>
+        <div>
+          <div class="small" style="font-weight:600">Harmonic stack at this frame</div>
+          <div class="small muted">What block 1 receives: rows are the 17 views (multiples of each candidate's frequency), columns are pitch candidates. A hum lights the whole-number rows in one column.</div>
+          <div class="plot" id="stackPlot" style="height:190px;margin-top:6px;cursor:default"></div>
+          <div class="faxis" id="stackAxis"></div>
+        </div>
+        <div>
+          <div class="small" style="font-weight:600">Comb at <span id="combAt">the predicted pitch</span></div>
+          <div class="small muted">dB above the frame's floor in each view. Filled bars are harmonics, hollow bars the gaps between them.</div>
+          <svg id="combBars" viewBox="0 0 320 130" style="width:100%;margin-top:4px"></svg>
+        </div>
+        <div>
+          <div class="small" style="font-weight:600">Salience across pitch candidates</div>
+          <svg id="salLine" viewBox="0 0 320 120" style="width:100%;margin-top:4px"></svg>
+          <div class="legend"><span><i class="sw" style="background:var(--hum)"></i>hum</span><span><i class="sw" style="background:var(--whistle)"></i>whistle</span><span><i class="sw" style="background:var(--ink-3)"></i>spectrum (scaled)</span></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section>
+    <h2>Every recording, scored</h2>
+    <p class="muted">Frame shares use the detector's start threshold (<span class="mono" id="thrTxt"></span>). For hum and whistle clips, recall and pitch are measured against the reference labels; "wrong kind" is the share of labelled frames where the other class also fired. Highlighted cells on negatives are false detections. Click a row to open it in the explorer (clips over 20 s are shown cut to their first 20 s; speech, noise and silence are a sample).</p>
+    <div class="card scroll-x" style="max-height:620px;overflow-y:auto;padding:0 8px 8px"><table id="scoreTable"></table></div>
+  </section>
+
+  <section>
+    <h2>Decision space</h2>
+    <p class="muted">The presence head is a single linear layer, so these two numbers are exactly what it decides on. Each dot is one frame (up to 260 per recording, all 41 recordings). Dashed lines are the start threshold. Frames inside a hum or whistle recording but outside its reference label are drawn grey. Click a dot from an explorer clip to jump there.</p>
+    <div class="card">
+      <div class="legend" id="scLegend" style="margin-bottom:8px"></div>
+      <div style="position:relative;width:100%;aspect-ratio:16/9;max-height:560px"><canvas id="scatter" style="width:100%;height:100%"></canvas></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Does the harmonic view separate hums from speech?</h2>
+    <p class="muted">The median harmonic-stack input at the pitch candidate the model cares about: the pYIN pitch on hum frames, the reference pitch on whistle frames, and the hum salience peak on speech frames. The band behind each line is the middle half of frames.</p>
+    <div class="grid2">
+      <div class="card"><h3 style="margin-bottom:6px">Input comb at the candidate pitch</h3><div class="legend" id="combLegend"></div><svg id="combChart" viewBox="0 0 560 300" style="width:100%"></svg></div>
+      <div class="card"><h3 style="margin-bottom:6px">Which views drive presence</h3><p class="small muted">Gradient × input of the presence logit, per view, summed over pitch candidates and averaged per frame. Baseline: each frame's floor. Positive = this view's energy raised the score.</p><div class="legend" id="attrLegend" style="margin-top:6px"></div><svg id="attrChart" viewBox="0 0 560 280" style="width:100%"></svg></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Pitch accuracy and learned weights</h2>
+    <div class="grid2">
+      <div class="card"><h3>Pitch error against the reference</h3><p class="small muted">Salience peak minus reference, on labelled frames with presence ≥ 0.5. Log count scale, so a handful of octave errors (±1200 ¢) would still show.</p><svg id="histChart" viewBox="0 0 560 280" style="width:100%"></svg><div class="legend"><span><i class="sw" style="background:var(--hum)"></i>hum vs pYIN</span><span><i class="sw" style="background:var(--whistle)"></i>whistle vs peak_tracker</span></div></div>
+      <div class="card"><h3>Block 1 weights per harmonic view</h3><p class="small muted">Each of the 24 filters' total weight on each view (3×3 kernel summed). A comb detector would show filters that are positive on whole-number rows and negative on the half rows.</p><div style="position:relative"><svg id="w0Chart" viewBox="0 0 560 300" style="width:100%"></svg></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Training run</h2>
+    <p class="muted" id="histNote"></p>
+    <div class="grid2">
+      <div class="card"><h3>F1 per validation</h3><div class="legend" id="f1Legend"></div><svg id="f1Chart" viewBox="0 0 560 260" style="width:100%"></svg></div>
+      <div class="card"><h3>False-positive rate per validation</h3><div class="legend" id="fpLegend"></div><svg id="fpChart" viewBox="0 0 560 260" style="width:100%"></svg></div>
+    </div>
+  </section>
+
+  <p class="small muted" id="footer"></p>
+</div>
+<div id="tip" hidden></div>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const tok = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const rgb = h => { h = h.replace("#", ""); if (h.length === 3) h = h.split("").map(c => c + c).join(""); const n = parseInt(h, 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const lerp = (a, b, t) => a + (b - a) * t;
+const mix = (c1, c2, t) => [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+const pct = (x, d = 0) => x == null ? "–" : (100 * x).toFixed(d) + "%";
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (parent) parent.appendChild(e); return e; };
+const KIND_VAR = { hum: "--hum", whistle: "--whistle", speech: "--speech" };
+const tip = $("#tip");
+function showTip(html, x, y) { tip.innerHTML = html; tip.hidden = false; const w = tip.offsetWidth, h = tip.offsetHeight; tip.style.left = clamp(x + 14, 4, innerWidth - w - 4) + "px"; tip.style.top = clamp(y + 14, 4, innerHeight - h - 4) + "px"; }
+function hideTip() { tip.hidden = true; }
+
+let D, C = null, PX = {}, pinned = null, curT = 0;
+const fmtHz = hz => hz >= 1000 ? (hz / 1000).toFixed(2) + " kHz" : hz.toFixed(0) + " Hz";
+
+function decode(uri) {
+  return new Promise((res, rej) => { const im = new Image(); im.onload = () => {
+    const c = document.createElement("canvas"); c.width = im.width; c.height = im.height;
+    const g = c.getContext("2d"); g.drawImage(im, 0, 0);
+    res({ w: im.width, h: im.height, d: g.getImageData(0, 0, im.width, im.height).data, img: im }); };
+    im.onerror = rej; im.src = uri; });
+}
+
+/* ------------------------------------------------------------------ generic svg charts */
+function niceTicks(lo, hi, n = 5) {
+  const span = hi - lo, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || mag * 10;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10)); return out;
+}
+function frame(svg, { W, H, m, x, y, xTicks, yTicks, xFmt = String, yFmt = String, xLabel, yLabel }) {
+  svg.innerHTML = "";
+  const g = el("g", { class: "grid" }, svg);
+  for (const t of yTicks) { el("line", { x1: m.l, x2: W - m.r, y1: y(t), y2: y(t) }, g); const tx = el("text", { x: m.l - 6, y: y(t) + 4, "text-anchor": "end" }, svg); tx.textContent = yFmt(t); }
+  for (const t of xTicks) { const tx = el("text", { x: x(t), y: H - m.b + 15, "text-anchor": "middle" }, svg); tx.textContent = xFmt(t); }
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: "var(--ink-3)" }, svg);
+  if (xLabel) { const t = el("text", { x: (m.l + W - m.r) / 2, y: H - 4, "text-anchor": "middle" }, svg); t.textContent = xLabel; }
+  if (yLabel) { const t = el("text", { x: 12, y: (m.t + H - m.b) / 2, "text-anchor": "middle", transform: `rotate(-90 12 ${(m.t + H - m.b) / 2})` }, svg); t.textContent = yLabel; }
+}
+function legend(host, items) {
+  host.innerHTML = items.map(it => `<span><i class="sw${it.dash ? " dash" : ""}" style="background:var(${it.v});color:var(${it.v})"></i>${it.name}</span>`).join("");
+}
+/* line chart with hover readout by nearest x */
+function lineChart(svg, { series, xDomain, yDomain, xTicks, yTicks, xFmt, yFmt, xLabel, yLabel, tipFmt, bands = [] }) {
+  const [W, H] = svg.viewBox.baseVal ? [svg.viewBox.baseVal.width, svg.viewBox.baseVal.height] : [560, 260];
+  const m = { l: 48, r: 14, t: 10, b: 36 };
+  const x = v => m.l + (v - xDomain[0]) / (xDomain[1] - xDomain[0]) * (W - m.l - m.r);
+  const y = v => H - m.b - (v - yDomain[0]) / (yDomain[1] - yDomain[0]) * (H - m.t - m.b);
+  frame(svg, { W, H, m, x, y, xTicks, yTicks, xFmt, yFmt, xLabel, yLabel });
+  for (const b of bands) el("rect", { x: x(b[0]), width: x(b[1]) - x(b[0]), y: m.t, height: H - m.t - m.b, fill: "var(--ink)", opacity: 0.045 }, svg);
+  for (const s of series) {
+    if (s.lo && s.hi) {
+      const pts = s.pts.map((p, i) => `${x(p[0])},${y(s.hi[i])}`).concat(s.pts.slice().reverse().map((p, i) => `${x(p[0])},${y(s.lo[s.pts.length - 1 - i])}`));
+      el("polygon", { points: pts.join(" "), fill: `var(${s.v})`, opacity: 0.12 }, svg);
+    }
+    el("polyline", { points: s.pts.map(p => `${x(p[0])},${y(p[1])}`).join(" "), fill: "none", stroke: `var(${s.v})`, "stroke-width": 2, "stroke-dasharray": s.dash ? "5 4" : "none", "stroke-linejoin": "round" }, svg);
+    if (s.dots) for (const p of s.pts) el("circle", { cx: x(p[0]), cy: y(p[1]), r: 3.2, fill: `var(${s.v})`, stroke: "var(--surface)", "stroke-width": 1.5 }, svg);
+  }
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--ink-3)", opacity: 0 }, svg);
+  const hit = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+  const xs = series[0].pts.map(p => p[0]);
+  hit.addEventListener("mousemove", e => {
+    const r = svg.getBoundingClientRect(), vx = (e.clientX - r.left) / r.width * W;
+    let i = 0, best = 1e9; xs.forEach((xv, j) => { const d = Math.abs(x(xv) - vx); if (d < best) { best = d; i = j; } });
+    cross.setAttribute("x1", x(xs[i])); cross.setAttribute("x2", x(xs[i])); cross.setAttribute("opacity", 1);
+    showTip(tipFmt(i, xs[i]), e.clientX, e.clientY);
+  });
+  hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+  return { x, y };
+}
+
+/* ------------------------------------------------------------------ header + findings */
+function weighted(rows, key) { let n = 0, s = 0; for (const r of rows) if (r[key] != null) { s += r[key] * r.frames; n += r.frames; } return n ? s / n : null; }
+function renderHeader() {
+  const a = D.arch;
+  $("#hdr-eyebrow").textContent = `whistle-house · ${D.checkpoint} · pipeline ${D.pipeline}`;
+  const last = D.history[D.history.length - 1] || {};
+  $("#hdr-sub").innerHTML = `A look inside the whistle + hum detector: the ${a.harmonics.length}-view harmonic stack, ${a.dilations.length} causal blocks of ${a.channels} channels and the two heads, run on every recording from the room mic. ${D.params.toLocaleString()} parameters, ${a.n_bins} log-frequency bins (${fmtHz(D.freqs[0])} to ${fmtHz(D.freqs[D.freqs.length - 1])}), ${D.fps.toFixed(1)} frames per second. Trained for ${D.history.length} validations.`;
+  $("#netIntro").textContent = `Every box below is a stage you can watch in the clip explorer. Time runs left to right through causal convolutions, so a frame only sees the past plus the ${a.lookahead}-frame lookahead. Frequency stays on the log axis the whole way; the harmonic stack gives each pitch candidate its own view of its overtones.`;
+  $("#thrTxt").textContent = `p ≥ ${D.on_threshold}`;
+  const S = D.summary, by = l => S.filter(r => r.label === l);
+  const sp = by("speech"), hum = by("hum"), wh = by("whistle"), neg = S.filter(r => !["hum", "whistle"].includes(r.label));
+  const spMin = sp.reduce((s, r) => s + r.frames, 0) / D.fps / 60;
+  const spHumS = sp.reduce((s, r) => s + r.hum_event_s, 0);
+  const spVal = sp.filter(r => r.split !== "train");
+  const negWh = neg.reduce((s, r) => s + r.whistle_events, 0);
+  const wrong = Math.max(...hum.concat(wh).map(r => r.wrong_kind || 0));
+  const humPitch = weighted(hum, "pitch_ok"), whPitch = weighted(wh, "pitch_ok");
+  const oct = Math.max(...hum.concat(wh).map(r => r.octave_err || 0));
+  const cb = D.comb, H = D.arch.harmonics;
+  const contrast = g => { const md = cb[g].median; if (!md.length) return null; let s = 0, n = 0; for (const h of [1, 2, 3]) { const i = H.indexOf(h), j = H.indexOf(h + 0.5); s += md[i] - md[j]; n++; } return s / n; };
+  const F = [
+    { v: "--hum", tag: "hum recall", big: pct(weighted(hum, "recall"), 1), txt: `of pYIN-voiced frames in the ${hum.length} hum recordings are detected as hum; ${pct(humPitch, 0)} of them within 50 cents of pYIN. Held-out clips: ${hum.filter(r => r.split !== "train").map(r => pct(r.recall, 0)).join(", ")}.` },
+    { v: "--whistle", tag: "whistle recall", big: pct(weighted(wh, "recall"), 1), txt: `of labelled frames in the ${wh.length} whistle recordings; ${pct(whPitch, 0)} within 50 cents. No whistle event fired on any speech, noise or silence recording (${negWh} events).` },
+    { v: "--speech", tag: "speech → false hum", big: (spHumS / spMin).toFixed(1) + " s/min", txt: `of hum events on ${spMin.toFixed(1)} min of speech; hum presence is on for ${pct(weighted(sp, "hum_active"), 1)} of speech frames (held-out speech: ${spVal.map(r => pct(r.hum_active, 0)).join(", ")}).${weighted(sp, "hum_active") > 0.02 ? " This is the main failure." : ""}` },
+    { v: "--ink-3", tag: "kinds kept apart", big: pct(wrong, 1), txt: `worst share of labelled frames where the other class also fired. Octave errors: ${pct(oct, 1)} at worst.${oct < 0.01 ? " Overtones are not being reported as notes." : ""}` },
+    { v: "--ink-3", tag: "comb contrast h1–h3", big: (contrast("hum@f0") ?? 0).toFixed(0) + " dB", txt: `harmonics over the gaps beside them in the stack, on hums. Speech frames that fire as hum: ${(contrast("speech false hum@argmax") ?? 0).toFixed(0)} dB; speech frames that don't: ${(contrast("speech other@argmax") ?? 0).toFixed(0)} dB.${(contrast("speech false hum@argmax") ?? 0) > 6 ? " Per frame, vowels look like weak hums." : ""}` },
+  ];
+  $("#findings").innerHTML = F.map(f => `<div class="card finding"><span class="tag"><i class="dot" style="background:var(${f.v})"></i>${f.tag}</span><span class="big">${f.big}</span><p class="small muted">${f.txt}</p></div>`).join("");
+  $("#footer").textContent = `Generated by whistle-house inspect-model from ${D.checkpoint} on the mic recordings in data/recordings. Reference pitch: pYIN (hums), peak_tracker with the training labeller's strict params (whistles).`;
+}
+
+/* ------------------------------------------------------------------ architecture diagram */
+function renderArch() {
+  const svg = $("#arch"), a = D.arch; svg.innerHTML = "";
+  const box = (x, y, w, h, title, lines, v = "--ink-3", fill = "var(--surface)") => {
+    el("rect", { x, y, width: w, height: h, rx: 5, fill, stroke: `var(${v})`, "stroke-width": 1.3 }, svg);
+    const t = el("text", { x: x + 10, y: y + 20, style: "font:600 13px var(--f-display);fill:var(--ink)" }, svg); t.textContent = title;
+    lines.forEach((l, i) => { const tt = el("text", { x: x + 10, y: y + 38 + i * 15 }, svg); tt.textContent = l; });
+  };
+  const arrow = (x1, y1, x2, y2) => { el("line", { x1, y1, x2, y2, stroke: "var(--ink-3)", "stroke-width": 1.3 }, svg); el("path", { d: `M${x2} ${y2} l-6 -4 v8 z`, fill: "var(--ink-3)", transform: `rotate(${Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI} ${x2} ${y2})` }, svg); };
+  box(10, 90, 150, 110, "Log spectrogram", [`${a.n_bins} bins, ${a.bins_per_octave}/oct`, `${fmtHz(D.freqs[0])}–${fmtHz(D.freqs.at(-1))}`, `stft_log, ${D.fps.toFixed(1)} frames/s`, `normalised (μ ${D.norm.mean.toFixed(1)} dB)`]);
+  arrow(160, 145, 190, 145);
+  box(190, 90, 170, 110, "Harmonic stack", [`${a.harmonics.length} views per bin:`, `f/3, f/2, 1, 1.5, … ${Math.max(...a.harmonics)}×f`, `fixed gathers, no weights`, `→ ${a.harmonics.length} × ${a.n_bins} per frame`], "--hum");
+  arrow(360, 145, 390, 145);
+  let rf = 1; const bw = 108, gap = 14;
+  a.dilations.forEach((d, i) => {
+    rf += (a.kernel_t - 1) * d;
+    const x = 390 + i * (bw + gap);
+    box(x, 90, bw, 110, `Block ${i + 1}`, [`3×3 conv, ${a.channels} ch`, `time dilation ${d}`, `sees ${rf} frames`, `(${(rf / D.fps * 1000).toFixed(0)} ms)`]);
+    el("rect", { x: x + 8, y: 210, width: bw - 16, height: 22, rx: 4, fill: "none", stroke: "var(--ink-3)", "stroke-dasharray": "3 3" }, svg);
+    const t = el("text", { x: x + bw / 2, y: 225, "text-anchor": "middle" }, svg); t.textContent = "freq context";
+    el("line", { x1: x + bw / 2, y1: 200, x2: x + bw / 2, y2: 210, stroke: "var(--ink-3)" }, svg);
+    if (i < a.dilations.length - 1) arrow(x + bw, 145, x + bw + gap, 145);
+  });
+  const xe = 390 + a.dilations.length * (bw + gap) - gap;
+  arrow(xe, 130, xe + 20, 60); arrow(xe, 160, xe + 20, 230);
+  box(xe + 20, 12, 160, 96, "Salience head", ["1×1 conv per bin", `${a.classes.length} × ${a.n_bins}: where is`, "each class's pitch?"], "--whistle");
+  box(xe + 20, 186, 160, 100, "Presence head", ["mean + max over bins", `→ ${2 * a.channels} → linear → ${a.classes.length}`, "is a hum / whistle on?"], "--whistle");
+  const n = el("text", { x: 10, y: 255 }, svg); n.textContent = `Lookahead ${a.lookahead} frames (${(a.lookahead / D.fps * 1000).toFixed(0)} ms): a frame's output waits for ${a.lookahead} future frames.`;
+  const n2 = el("text", { x: 10, y: 272 }, svg); n2.textContent = `Freq context: each block pools its features over all bins (mean + max) and adds them back to every bin, starting from zero.`;
+}
+
+/* ------------------------------------------------------------------ score table */
+function renderTable() {
+  const t = $("#scoreTable"), S = D.summary, have = new Set(D.clips.map(c => c.id));
+  const order = ["hum", "whistle", "speech", "noise", "silence"];
+  const pill = (v, bad, warn, good = false) => v == null ? "–" : `<span class="pill ${v >= bad ? "bad" : v >= warn ? "warn" : "ok"}">${pct(v, 1)}</span>`;
+  let h = `<thead><tr><th class="l">recording</th><th class="l">split</th><th>secs</th><th>hum on</th><th>hum events</th><th>whistle on</th><th>whistle events</th><th>labelled</th><th>recall</th><th>pitch ±50¢</th><th>wrong kind</th></tr></thead><tbody>`;
+  for (const lab of order) {
+    const rows = S.filter(r => r.label === lab); if (!rows.length) continue;
+    h += `<tr class="grp"><td colspan="11">${lab} · ${rows.length}</td></tr>`;
+    for (const r of rows) {
+      const pos = r.label === "hum" || r.label === "whistle";
+      const humOn = r.label === "hum" ? pct(r.hum_active, 1) : pill(r.hum_active, 0.1, 0.02);
+      const whOn = r.label === "whistle" ? pct(r.whistle_active, 1) : pill(r.whistle_active, 0.1, 0.02);
+      const ev = (n, s) => n ? `${n} · ${s.toFixed(1)} s` : "–";
+      h += `<tr class="${have.has(r.id) ? "click" : ""}" data-id="${r.id}"><td class="mono">${r.id}${have.has(r.id) ? "" : ' <span class="muted">(table only)</span>'}</td><td class="l muted">${r.split || ""}</td><td class="num">${r.dur}</td><td class="num">${humOn}</td><td class="num">${ev(r.hum_events, r.hum_event_s)}</td><td class="num">${whOn}</td><td class="num">${ev(r.whistle_events, r.whistle_event_s)}</td><td class="num">${pos ? pct(r.labelled, 0) : ""}</td><td class="num">${pos ? pct(r.recall, 1) : ""}</td><td class="num">${pos ? pct(r.pitch_ok, 1) : ""}</td><td class="num">${pos ? pill(r.wrong_kind, 0.05, 0.01) : ""}</td></tr>`;
+    }
+  }
+  t.innerHTML = h + "</tbody>";
+  t.addEventListener("click", e => { const tr = e.target.closest("tr.click"); if (tr) { loadClip(tr.dataset.id); $("#clipSel").scrollIntoView({ behavior: "smooth", block: "start" }); } });
+}
+
+/* ------------------------------------------------------------------ decision-space scatter */
+const scatterState = { pts: [] };
+function scatterColor(lab) { if (lab === "hum" || lab === "whistle" || lab === "speech") return tok(KIND_VAR[lab]); return tok("--other"); }
+function renderScatter() {
+  legend($("#scLegend"), [{ name: "hum frames", v: "--hum" }, { name: "whistle frames", v: "--whistle" }, { name: "speech", v: "--speech" }, { name: "noise, silence, unlabelled gaps", v: "--other" }]);
+  const cv = $("#scatter"), dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr; const g = cv.getContext("2d"); g.scale(dpr, dpr);
+  const m = { l: 52, r: 14, t: 10, b: 40 };
+  const xs = D.scatter.map(p => p[0]), ys = D.scatter.map(p => p[1]);
+  const xd = [Math.max(-22, Math.min(...xs)) - 1, Math.min(22, Math.max(...xs)) + 1], yd = [Math.max(-22, Math.min(...ys)) - 1, Math.min(22, Math.max(...ys)) + 1];
+  const X = v => m.l + (clamp(v, xd[0], xd[1]) - xd[0]) / (xd[1] - xd[0]) * (W - m.l - m.r);
+  const Y = v => H - m.b - (clamp(v, yd[0], yd[1]) - yd[0]) / (yd[1] - yd[0]) * (H - m.t - m.b);
+  g.fillStyle = tok("--surface"); g.fillRect(0, 0, W, H);
+  g.font = "11px " + tok("--f-mono"); g.fillStyle = tok("--ink-2"); g.strokeStyle = tok("--rule"); g.lineWidth = 1;
+  for (const t of niceTicks(xd[0], xd[1], 8)) { g.beginPath(); g.moveTo(X(t), m.t); g.lineTo(X(t), H - m.b); g.stroke(); g.textAlign = "center"; g.fillText(t, X(t), H - m.b + 15); }
+  for (const t of niceTicks(yd[0], yd[1], 6)) { g.beginPath(); g.moveTo(m.l, Y(t)); g.lineTo(W - m.r, Y(t)); g.stroke(); g.textAlign = "right"; g.fillText(t, m.l - 6, Y(t) + 4); }
+  g.textAlign = "center"; g.fillText("whistle presence logit →", (m.l + W - m.r) / 2, H - 6);
+  g.save(); g.translate(13, (m.t + H - m.b) / 2); g.rotate(-Math.PI / 2); g.fillText("hum presence logit →", 0, 0); g.restore();
+  const thr = Math.log(D.on_threshold / (1 - D.on_threshold));
+  g.setLineDash([5, 4]); g.strokeStyle = tok("--ink-3");
+  g.beginPath(); g.moveTo(X(thr), m.t); g.lineTo(X(thr), H - m.b); g.moveTo(m.l, Y(thr)); g.lineTo(W - m.r, Y(thr)); g.stroke(); g.setLineDash([]);
+  const order = p => p[2] === "hum" ? 3 : p[2] === "whistle" ? 2 : p[2] === "speech" ? 1 : 0;
+  const pts = D.scatter.slice().sort((a, b) => order(a) - order(b));
+  scatterState.pts = pts.map(p => ({ x: X(p[0]), y: Y(p[1]), p }));
+  for (const s of scatterState.pts) { g.globalAlpha = order(s.p) ? 0.55 : 0.35; g.fillStyle = scatterColor(s.p[2]); g.beginPath(); g.arc(s.x, s.y, 2.6, 0, 7); g.fill(); }
+  g.globalAlpha = 1;
+  g.fillStyle = tok("--ink-2"); g.textAlign = "left";
+  g.fillText("hum fires", m.l + 6, Y(thr) - 6); g.textAlign = "right"; g.fillText("whistle fires", X(thr) - 6, H - m.b - 6);
+  if (!cv.dataset.bound) {
+    cv.dataset.bound = 1;
+    const near = e => { const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top; let best = null, bd = 64; for (const s of scatterState.pts) { const d = (s.x - mx) ** 2 + (s.y - my) ** 2; if (d < bd) { bd = d; best = s; } } return best; };
+    cv.addEventListener("mousemove", e => { const s = near(e); if (!s) { hideTip(); cv.style.cursor = "default"; return; } const [wl, hl, lab, id, t] = s.p; const sig = v => (1 / (1 + Math.exp(-v))).toFixed(2); const has = D.clips.some(c => c.id === id && t < c.T); cv.style.cursor = has ? "pointer" : "default"; showTip(`<b>${lab}</b> · ${id}<br>t = ${(t / D.fps).toFixed(2)} s<br>hum p ${sig(hl)} · whistle p ${sig(wl)}${has ? "<br><span style='color:var(--ink-3)'>click to open</span>" : ""}`, e.clientX, e.clientY); });
+    cv.addEventListener("mouseleave", hideTip);
+    cv.addEventListener("click", e => { const s = near(e); if (!s) return; const [, , , id, t] = s.p; const c = D.clips.find(c => c.id === id); if (c && t < c.T) { loadClip(id, t); $("#clipSel").scrollIntoView({ behavior: "smooth", block: "start" }); } });
+  }
+}
+
+/* ------------------------------------------------------------------ comb, attribution, hist, weights, history */
+const hLabel = h => Math.abs(h - 1 / 3) < 1e-6 ? "⅓" : h === 0.5 ? "½" : Number.isInteger(h) ? String(h) : h.toFixed(1);
+function renderComb() {
+  const H = D.arch.harmonics, idx = H.map((_, i) => i);
+  const groups = [["hum@f0", "--hum", "hum, at pYIN pitch", false], ["whistle@f0", "--whistle", "whistle, at reference pitch", false], ["speech false hum@argmax", "--speech", "speech frames that fire as hum", false], ["speech other@argmax", "--speech", "other loud speech frames", true]];
+  const series = groups.filter(g => D.comb[g[0]].n).map(([k, v, name, dash]) => ({ v, dash, dots: true, name: `${name} (${D.comb[k].n.toLocaleString()})`, pts: D.comb[k].median.map((m, i) => [i, m]), lo: D.comb[k].p25, hi: D.comb[k].p75, key: k }));
+  legend($("#combLegend"), series);
+  const ymax = Math.max(...series.flatMap(s => s.hi)) + 5;
+  lineChart($("#combChart"), {
+    series, xDomain: [-0.5, H.length - 0.5], yDomain: [0, ymax], xTicks: idx, yTicks: niceTicks(0, ymax, 5),
+    xFmt: i => hLabel(H[i]), yFmt: v => v, xLabel: "view (multiple of the candidate's frequency)", yLabel: "dB above frame floor",
+    bands: idx.filter(i => Number.isInteger(H[i])).map(i => [i - 0.5, i + 0.5]),
+    tipFmt: i => `<b>view ${hLabel(H[i])}×</b><br>` + series.map(s => `${s.name.split(" (")[0]}: ${s.pts[i][1].toFixed(0)} dB`).join("<br>"),
+  });
+  // attribution bars
+  const svg = $("#attrChart"); const W = 560, Hh = 280, m = { l: 48, r: 14, t: 10, b: 36 };
+  const sum = k => D.attr[k].map(row => row.reduce((a, b) => a + b, 0));
+  const bars = [["hum|pos", "--hum", "hum presence, on hums"], ["hum|neg", "--speech", "hum presence, on false alarms"], ["whistle|pos", "--whistle", "whistle presence, on whistles"]].filter(b => D.attr_n[b[0]]).map(([k, v, name]) => ({ k, v, name: `${name} (${D.attr_n[k].toLocaleString()} frames)`, vals: sum(k) }));
+  legend($("#attrLegend"), bars);
+  const lim = Math.max(...bars.flatMap(b => b.vals.map(Math.abs))) * 1.1;
+  const x = i => m.l + (i + 0.5) / H.length * (W - m.l - m.r), y = v => m.t + (lim - v) / (2 * lim) * (Hh - m.t - m.b);
+  frame(svg, { W, H: Hh, m, x, y, xTicks: idx, yTicks: niceTicks(-lim, lim, 6), xFmt: i => hLabel(H[i]), yFmt: v => v, xLabel: "view", yLabel: "attribution (logit units)" });
+  for (const i of idx.filter(i => Number.isInteger(H[i]))) el("rect", { x: x(i) - (W - m.l - m.r) / H.length / 2, width: (W - m.l - m.r) / H.length, y: m.t, height: Hh - m.t - m.b, fill: "var(--ink)", opacity: 0.045 }, svg);
+  el("line", { x1: m.l, x2: W - m.r, y1: y(0), y2: y(0), stroke: "var(--ink-3)" }, svg);
+  const bw = (W - m.l - m.r) / H.length / (bars.length + 1);
+  bars.forEach((b, j) => b.vals.forEach((v, i) => {
+    const bx = x(i) - bw * bars.length / 2 + j * bw;
+    const r = el("rect", { x: bx + 0.5, width: bw - 1, y: Math.min(y(0), y(v)), height: Math.max(1, Math.abs(y(v) - y(0))), fill: `var(${b.v})`, rx: 1.5 }, svg);
+    r.addEventListener("mousemove", e => showTip(`<b>${b.name.split(" (")[0]}</b><br>view ${hLabel(H[i])}×: ${v.toFixed(2)}`, e.clientX, e.clientY)); r.addEventListener("mouseleave", hideTip);
+  }));
+}
+function renderHist() {
+  const svg = $("#histChart"), W = 560, Hh = 280, m = { l: 48, r: 14, t: 10, b: 36 };
+  const ks = Object.keys(D.hist).filter(k => D.hist[k].n);
+  const lo = D.hist[ks[0]].lo, step = D.hist[ks[0]].step, nb = D.hist[ks[0]].counts.length;
+  const maxC = Math.max(...ks.flatMap(k => D.hist[k].counts));
+  const x = c => m.l + (c - lo) / (nb * step) * (W - m.l - m.r), y = c => Hh - m.b - Math.log10(c + 1) / Math.log10(maxC + 1) * (Hh - m.t - m.b);
+  frame(svg, { W, H: Hh, m, x, y, xTicks: [-2400, -1200, 0, 1200, 2400], yTicks: [0, 9, 99, 999, 9999].filter(v => v <= maxC * 1.2), xFmt: v => (v > 0 ? "+" : "") + v + "¢", yFmt: v => v + 1, xLabel: "pitch error (cents; ±1200 = octave, +1902 = 3rd harmonic)", yLabel: "frames (log)" });
+  for (const c of [-1200, 1200, 1902]) el("line", { x1: x(c), x2: x(c), y1: m.t, y2: Hh - m.b, stroke: "var(--ink-3)", "stroke-dasharray": "2 3" }, svg);
+  const bw = (W - m.l - m.r) / nb;
+  ks.forEach((k, j) => D.hist[k].counts.forEach((c, i) => {
+    if (!c) return; const v = KIND_VAR[k], bx = m.l + i * bw + j * bw / 2;
+    const r = el("rect", { x: bx, width: Math.max(1, bw / 2 - 0.5), y: y(c), height: Hh - m.b - y(c), fill: `var(${v})` }, svg);
+    r.addEventListener("mousemove", e => showTip(`<b>${k}</b><br>${lo + i * step}…${lo + (i + 1) * step} ¢: ${c} frames`, e.clientX, e.clientY)); r.addEventListener("mouseleave", hideTip);
+  }));
+}
+function renderWeights() {
+  const svg = $("#w0Chart"), w = D.w0, H = D.arch.harmonics, C = w.length, W = 560, Hh = 300, m = { l: 48, r: 60, t: 10, b: 36 };
+  svg.innerHTML = "";
+  const lim = Math.max(...w.flat().map(Math.abs));
+  // order filters by their comb score: harmonics minus gaps
+  const score = r => H.reduce((s, h, i) => s + (Number.isInteger(h) && h >= 1 ? r[i] : h > 1 ? -r[i] : 0), 0);
+  const order = w.map((r, i) => i).sort((a, b) => score(w[b]) - score(w[a]));
+  const cw = (W - m.l - m.r) / H.length, ch = (Hh - m.t - m.b) / C;
+  const neg = rgb(tok("--div-neg")), pos = rgb(tok("--div-pos")), mid = rgb(tok("--div-mid"));
+  order.forEach((ci, row) => H.forEach((h, j) => {
+    const v = w[ci][j] / lim, c = v < 0 ? mix(mid, neg, -v) : mix(mid, pos, v);
+    const r = el("rect", { x: m.l + j * cw, y: m.t + row * ch, width: cw - 1, height: ch - 1, fill: `rgb(${c.map(Math.round)})` }, svg);
+    r.addEventListener("mousemove", e => showTip(`filter ${ci + 1} · view ${hLabel(h)}×<br>total weight ${w[ci][j].toFixed(3)}`, e.clientX, e.clientY)); r.addEventListener("mouseleave", hideTip);
+  }));
+  H.forEach((h, j) => { const t = el("text", { x: m.l + j * cw + cw / 2, y: Hh - m.b + 15, "text-anchor": "middle", style: Number.isInteger(h) ? "font-weight:600;fill:var(--ink)" : "" }, svg); t.textContent = hLabel(h); });
+  const t1 = el("text", { x: m.l - 6, y: m.t + 8, "text-anchor": "end" }, svg); t1.textContent = "comb-";
+  const t1b = el("text", { x: m.l - 6, y: m.t + 20, "text-anchor": "end" }, svg); t1b.textContent = "like";
+  const t2 = el("text", { x: m.l - 6, y: Hh - m.b - 4, "text-anchor": "end" }, svg); t2.textContent = "least";
+  const xl = el("text", { x: (m.l + W - m.r) / 2, y: Hh - 4, "text-anchor": "middle" }, svg); xl.textContent = "view (bold = whole-number harmonic)";
+  // colour key
+  for (let i = 0; i < 40; i++) { const v = 1 - i / 39 * 2, c = v < 0 ? mix(mid, neg, -v) : mix(mid, pos, v); el("rect", { x: W - m.r + 18, y: m.t + i * (Hh - m.t - m.b) / 40, width: 12, height: (Hh - m.t - m.b) / 40 + 0.5, fill: `rgb(${c.map(Math.round)})` }, svg); }
+  const a = el("text", { x: W - m.r + 34, y: m.t + 8 }, svg); a.textContent = "+"; const b = el("text", { x: W - m.r + 34, y: Hh - m.b }, svg); b.textContent = "−";
+}
+function renderHistory() {
+  const hs = D.history; if (!hs.length) return;
+  const ep = hs.map(h => h.epoch);
+  const mk = (keys, svg, leg, yl) => {
+    const series = keys.filter(([k]) => hs.some(h => h[k] != null)).map(([k, v, name, dash]) => ({ v, dash, name, pts: hs.map(h => [h.epoch, h[k] ?? NaN]) }));
+    legend(leg, series);
+    const ys = series.flatMap(s => s.pts.map(p => p[1])).filter(Number.isFinite);
+    const yd = [Math.max(0, Math.min(...ys) - 0.03), Math.min(1, Math.max(...ys) + 0.03)];
+    lineChart(svg, { series, xDomain: [Math.min(...ep) - 0.5, Math.max(...ep) + 0.5], yDomain: yd, xTicks: ep.filter(e => e % Math.max(1, Math.ceil(ep.length / 10)) === 0 || e === 1), yTicks: niceTicks(yd[0], yd[1], 5), xFmt: String, yFmt: v => v.toFixed(2), xLabel: "validation (50 steps each)", yLabel: yl, tipFmt: (i, e) => `<b>validation ${e}</b><br>` + series.map(s => `${s.name}: ${Number.isFinite(s.pts[i][1]) ? s.pts[i][1].toFixed(3) : "–"}`).join("<br>") });
+  };
+  mk([["hum_f1", "--hum", "hum (val mix)"], ["mic_val_hum_f1", "--hum", "hum (held-out mic)", true], ["whistle_f1", "--whistle", "whistle (val mix)"], ["mic_val_whistle_f1", "--whistle", "whistle (held-out mic)", true]], $("#f1Chart"), $("#f1Legend"), "F1");
+  mk([["hum_false_positive_rate", "--hum", "hum (val mix)"], ["mic_val_hum_false_positive_rate", "--hum", "hum (held-out mic)", true], ["whistle_false_positive_rate", "--whistle", "whistle (val mix)"], ["mic_val_whistle_false_positive_rate", "--whistle", "whistle (held-out mic)", true]], $("#fpChart"), $("#fpLegend"), "false-positive rate");
+  const last = hs.at(-1);
+  $("#histNote").textContent = `The checkpoint's own validation metrics, ${hs.length} validations of 50 steps. The held-out mic set is ${D.summary.filter(r => r.split === "val").length} clips, so its curves are noisy. Last: hum F1 ${last.hum_f1?.toFixed(2)} on the validation mix vs ${last.mic_val_hum_f1?.toFixed(2)} on held-out mic clips; overfit gap ${last.overfit_gap?.toFixed(2)}.`;
+}
+
+/* ------------------------------------------------------------------ clip explorer */
+const STRIPS = [
+  { key: "spec", h: 210, title: "Spectrogram", sub: "log freq · reference pitch dashed, detected events solid" },
+  { key: "prob", h: 92, title: "Presence", sub: "per frame · start / continue thresholds dashed" },
+  { key: "sal_hum", h: 120, title: "Hum salience", sub: "pitch head, hum" },
+  { key: "sal_whistle", h: 120, title: "Whistle salience", sub: "pitch head, whistle" },
+  ...[1, 2, 3, 4, 5].map(i => ({ key: "block" + i, h: 70, title: `Block ${i}`, sub: "feature change: RMS over channels, each bin's clip median removed" })),
+  { key: "ctx", h: 70, title: "Freq context", sub: "mean |feedback| per block, light → dark = 1 → 5" },
+  { key: "pca", h: 110, title: "Block 5 features", sub: "top 3 principal components as RGB, shared across clips" },
+  { key: "contrib_hum", h: 110, title: "Hum presence inputs", sub: "each head input's push on the logit vs silence: 24 mean-pooled rows over 24 max-pooled · red up, blue down" },
+  { key: "contrib_whistle", h: 110, title: "Whistle presence inputs", sub: "as above, whistle head" },
+];
+function buildStrips() {
+  const host = $("#strips"); host.innerHTML = "";
+  for (const s of STRIPS) {
+    const row = document.createElement("div"); row.className = "strip";
+    row.innerHTML = `<div class="lab"><b>${s.title}</b><span>${s.sub}</span></div><div class="plot" data-k="${s.key}" style="height:${s.h}px"><canvas></canvas><svg class="ov" preserveAspectRatio="none"></svg><div class="cur"></div></div>`;
+    host.appendChild(row);
+  }
+  const tl = document.createElement("div"); tl.className = "tline"; tl.innerHTML = "<i></i><div id='tline'></div>"; host.appendChild(tl);
+  host.addEventListener("mousemove", e => { const p = e.target.closest(".plot"); if (!p || !C || pinned != null) return; setT(tFromEvent(e, p)); });
+  host.addEventListener("click", e => { const p = e.target.closest(".plot"); if (!p || !C) return; const t = tFromEvent(e, p); if (pinned != null && Math.abs(pinned - t) < 3) { pinned = null; } else { pinned = t; } setT(t); });
+}
+const tFromEvent = (e, p) => { const r = p.getBoundingClientRect(); return clamp(Math.floor((e.clientX - r.left) / r.width * C.T), 0, C.T - 1); };
+function paintMap(canvas, pix, fn) {
+  canvas.width = pix.w; canvas.height = pix.h;
+  const g = canvas.getContext("2d"), out = g.createImageData(pix.w, pix.h);
+  for (let i = 0; i < pix.w * pix.h; i++) { const c = fn(pix.d[i * 4] / 255, i); out.data[i * 4] = c[0]; out.data[i * 4 + 1] = c[1]; out.data[i * 4 + 2] = c[2]; out.data[i * 4 + 3] = 255; }
+  g.putImageData(out, 0, 0);
+}
+function binOf(hz) { return Math.log2(hz / D.freqs[0]) * D.arch.bins_per_octave; }
+function specDb(t, b) { const p = PX.spec; return C.spec.lo + p.d[((p.h - 1 - b) * p.w + t) * 4] / 255 * (C.spec.hi - C.spec.lo); }
+function salAt(kind, t, b) { const p = PX["sal_" + kind]; return p.d[((p.h - 1 - b) * p.w + t) * 4] / 255; }
+let specLo = -90, specHi = -20;
+function renderClip() {
+  const surf = rgb(tok("--surface")), ink = rgb(tok("--ink")), hum = rgb(tok("--hum")), wh = rgb(tok("--whistle"));
+  const neg = rgb(tok("--div-neg")), pos = rgb(tok("--div-pos")), mid = rgb(tok("--div-mid"));
+  const plot = k => $(`.plot[data-k="${k}"]`, $("#strips"));
+  const T = C.T, F = D.arch.n_bins;
+  // spectrogram with per-clip contrast
+  const s0 = (specLo - C.spec.lo) / (C.spec.hi - C.spec.lo), s1 = (specHi - C.spec.lo) / (C.spec.hi - C.spec.lo);
+  paintMap($("canvas", plot("spec")), PX.spec, v => mix(surf, ink, clamp((v - s0) / (s1 - s0), 0, 1) ** 0.9));
+  paintMap($("canvas", plot("sal_hum")), PX.sal_hum, v => mix(surf, hum, v));
+  paintMap($("canvas", plot("sal_whistle")), PX.sal_whistle, v => mix(surf, wh, v));
+  for (let i = 1; i <= 5; i++) paintMap($("canvas", plot("block" + i)), PX["block" + i], v => mix(surf, ink, v));
+  { const cv = $("canvas", plot("pca")); cv.width = PX.pca.w; cv.height = PX.pca.h; cv.getContext("2d").drawImage(PX.pca.img, 0, 0); }
+  for (const k of ["hum", "whistle"]) paintMap($("canvas", plot("contrib_" + k)), PX["contrib_" + k], v => { const d = (v - 0.5) * 2; return d < 0 ? mix(mid, neg, -d) : mix(mid, pos, d); });
+  // overlays
+  const ov = k => { const s = $("svg.ov", plot(k)); s.innerHTML = ""; return s; };
+  const sv = ov("spec"); sv.setAttribute("viewBox", `0 0 ${T} ${F}`);
+  const yb = b => F - 0.5 - b;
+  if (C.ref.kind) {
+    let d = "", pen = false;
+    C.ref.hz.forEach((hz, t) => { if (hz > 0) { d += `${pen ? "L" : "M"}${t + 0.5} ${yb(binOf(hz))}`; pen = true; } else pen = false; });
+    el("path", { d, fill: "none", stroke: `var(${KIND_VAR[C.ref.kind]})`, "stroke-width": 1.5, "stroke-dasharray": "3 3", "vector-effect": "non-scaling-stroke", opacity: 0.9 }, sv);
+  }
+  const t0 = C.times[0], dt = C.times[1];
+  for (const e of C.events) {
+    const pts = e.t.map((t, i) => `${(t - t0) / dt + 0.5},${yb(binOf(e.hz[i]))}`).join(" ");
+    el("polyline", { points: pts, fill: "none", stroke: "var(--surface)", "stroke-width": 4.5, "vector-effect": "non-scaling-stroke", opacity: 0.8 }, sv);
+    el("polyline", { points: pts, fill: "none", stroke: `var(${KIND_VAR[e.kind]})`, "stroke-width": 2, "vector-effect": "non-scaling-stroke" }, sv);
+  }
+  // y ticks (Hz) on frequency strips
+  for (const k of ["spec", "sal_hum", "sal_whistle"]) {
+    const p = plot(k); p.querySelectorAll(".yt").forEach(n => n.remove());
+    for (const hz of [100, 300, 1000, 3000]) { const b = binOf(hz); if (b < 2 || b > F - 3) continue; const d = document.createElement("span"); d.className = "yt"; d.style.top = (100 * (F - 0.5 - b) / F) + "%"; d.textContent = hz >= 1000 ? hz / 1000 + "k" : hz; p.appendChild(d); }
+  }
+  // presence
+  const pv = ov("prob"); pv.setAttribute("viewBox", `0 0 ${T} 100`);
+  for (const thr of [D.on_threshold, D.off_threshold]) el("line", { x1: 0, x2: T, y1: 100 - thr * 92 - 4, y2: 100 - thr * 92 - 4, stroke: "var(--ink-3)", "stroke-dasharray": "4 4", "vector-effect": "non-scaling-stroke" }, pv);
+  for (const k of ["whistle", "hum"]) el("polyline", { points: C.prob[k].map((p, t) => `${t + 0.5},${100 - p * 92 - 4}`).join(" "), fill: "none", stroke: `var(${KIND_VAR[k]})`, "stroke-width": 1.8, "vector-effect": "non-scaling-stroke" }, pv);
+  { const p = plot("prob"); p.querySelectorAll(".yt").forEach(n => n.remove()); for (const [v, txt] of [[1, "1"], [0, "0"]]) { const d = document.createElement("span"); d.className = "yt"; d.style.top = (100 - v * 92 - 4) + "%"; d.textContent = txt; p.appendChild(d); } }
+  // ctx lines
+  const cv = ov("ctx"); cv.setAttribute("viewBox", `0 0 ${T} 100`);
+  const cmax = Math.max(...C.blocks.flatMap(b => b.ctx)) || 1;
+  const ramp = ["#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95"];
+  C.blocks.forEach((b, i) => el("polyline", { points: b.ctx.map((v, t) => `${t + 0.5},${96 - v / cmax * 90}`).join(" "), fill: "none", stroke: ramp[i], "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" }, cv));
+  // time axis
+  const tl = $("#tline"); tl.innerHTML = ""; const dur = T * dt;
+  for (const s of niceTicks(0, dur, 10)) { if (s > dur) continue; const sp = document.createElement("span"); sp.style.left = (s / dur * 100) + "%"; sp.textContent = s + " s"; tl.appendChild(sp); }
+  setT(curT);
+}
+async function loadClip(id, t) {
+  const sel = $("#clipSel"); sel.value = id;
+  document.querySelectorAll("#scoreTable tr.sel").forEach(r => r.classList.remove("sel"));
+  const tr = $(`#scoreTable tr[data-id="${id}"]`); if (tr) tr.classList.add("sel");
+  $("#clipMeta").textContent = "loading…";
+  const c = await (await fetch(`clips/${id}.json`)).json();
+  const pix = {};
+  const jobs = [["spec", c.spec.png], ["sal_hum", c.sal.hum.png], ["sal_whistle", c.sal.whistle.png], ["pca", c.pca.png], ["contrib_hum", c.contrib.hum.png], ["contrib_whistle", c.contrib.whistle.png], ...c.blocks.map((b, i) => ["block" + (i + 1), b.png])];
+  await Promise.all(jobs.map(async ([k, u]) => { pix[k] = await decode(u); }));
+  C = c; PX = pix;
+  // contrast from this clip's spectrogram percentiles
+  const vals = []; for (let i = 0; i < pix.spec.d.length; i += 4 * 7) vals.push(pix.spec.d[i]); vals.sort((a, b) => a - b);
+  const q = p => c.spec.lo + vals[Math.floor(p * (vals.length - 1))] / 255 * (c.spec.hi - c.spec.lo);
+  specLo = q(0.25); specHi = Math.max(q(0.998), specLo + 20);
+  const row = D.summary.find(r => r.id === id);
+  $("#clipMeta").textContent = `${c.label} · ${c.split} split · ${(c.T / D.fps).toFixed(1)} s shown of ${row.dur} s · ${c.events.length} events (${c.events.filter(e => e.kind === "hum").length} hum, ${c.events.filter(e => e.kind === "whistle").length} whistle)`;
+  pinned = t ?? null;
+  curT = t ?? bestFrame(c);
+  renderClip();
+}
+function bestFrame(c) { // a frame worth looking at: strongest presence of the clip's own kind, else of anything
+  const k = c.ref.kind; let best = 0, bv = -1;
+  for (let t = 0; t < c.T; t++) { const v = k ? c.prob[k][t] + (c.ref.hz[t] > 0 ? 1 : 0) : Math.max(c.prob.hum[t], c.prob.whistle[t]); if (v > bv) { bv = v; best = t; } }
+  return best;
+}
+function setT(t) {
+  curT = t; if (!C) return;
+  document.querySelectorAll("#strips .cur").forEach(c => c.style.left = (100 * (t + 0.5) / C.T) + "%");
+  $("#pinState").textContent = pinned != null ? "pinned · click the frame again to release" : "following the pointer";
+  inspect(t);
+}
+
+/* frame inspector: recompute the harmonic stack exactly as the model's HarmonicStack does */
+function harmonicStack(t) {
+  const F = D.arch.n_bins, bpo = D.arch.bins_per_octave, H = D.arch.harmonics;
+  const col = new Float32Array(F); for (let b = 0; b < F; b++) col[b] = specDb(t, b);
+  let floor = Infinity; for (const v of col) floor = Math.min(floor, v);
+  return { col, floor, rows: H.map(m => { const sh = bpo * Math.log2(m), row = new Float32Array(F);
+    for (let b = 0; b < F; b++) { const p = b + sh; if (p < 0 || p > F - 1) { row[b] = floor; continue; } const lo = clamp(Math.floor(p), 0, F - 2), fr = p - lo; row[b] = col[lo] + fr * (col[lo + 1] - col[lo]); }
+    return row; }) };
+}
+function inspect(t) {
+  const F = D.arch.n_bins, H = D.arch.harmonics, st = harmonicStack(t);
+  const sal = { hum: [], whistle: [] }; for (const k of ["hum", "whistle"]) for (let b = 0; b < F; b++) sal[k].push(salAt(k, t, b));
+  const am = k => sal[k].indexOf(Math.max(...sal[k]));
+  const ph = C.prob.hum[t], pw = C.prob.whistle[t], ref = C.ref.hz[t];
+  const kind = C.ref.kind && ref > 0 ? C.ref.kind : ph >= pw ? "hum" : "whistle";
+  const cand = C.ref.kind && ref > 0 ? Math.round(binOf(ref)) : am(kind);
+  $("#readout").innerHTML = [
+    ["time", `${(t / D.fps).toFixed(2)} s (frame ${t})`],
+    ["hum p", `${ph.toFixed(2)} · peak ${fmtHz(D.freqs[am("hum")])}`],
+    ["whistle p", `${pw.toFixed(2)} · peak ${fmtHz(D.freqs[am("whistle")])}`],
+    ["reference", C.ref.kind ? (ref > 0 ? `${C.ref.kind} ${fmtHz(ref)}` : "none at this frame") : "no labels (negative clip)"],
+  ].map(([a, b]) => `<dt>${a}</dt><dd>${b}</dd>`).join("");
+  // stack heatmap
+  const plot = $("#stackPlot"); let cv = $("canvas", plot); if (!cv) { plot.innerHTML = "<canvas></canvas><svg class='ov' preserveAspectRatio='none'></svg>"; cv = $("canvas", plot); }
+  cv.width = F; cv.height = H.length; const g = cv.getContext("2d"), img = g.createImageData(F, H.length);
+  const surf = rgb(tok("--surface")), ink = rgb(tok("--ink"));
+  let top = 1; for (const r of st.rows) for (const v of r) top = Math.max(top, v - st.floor);
+  H.forEach((_, j) => { const row = st.rows[j], y = H.length - 1 - j; for (let b = 0; b < F; b++) { const c = mix(surf, ink, clamp((row[b] - st.floor) / top, 0, 1) ** 1.3); const o = (y * F + b) * 4; img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255; } });
+  g.putImageData(img, 0, 0);
+  const ov = $("svg.ov", plot); ov.setAttribute("viewBox", `0 0 ${F} ${H.length}`); ov.innerHTML = "";
+  const vline = (b, v, dash) => el("line", { x1: b + 0.5, x2: b + 0.5, y1: 0, y2: H.length, stroke: `var(${v})`, "stroke-width": 1.5, "stroke-dasharray": dash ? "3 2" : "none", "vector-effect": "non-scaling-stroke" }, ov);
+  if (ref > 0) vline(binOf(ref), KIND_VAR[C.ref.kind], true);
+  if (ph >= D.off_threshold) vline(am("hum"), "--hum");
+  if (pw >= D.off_threshold) vline(am("whistle"), "--whistle");
+  plot.querySelectorAll(".yt").forEach(n => n.remove());
+  for (const [j, txt] of [[H.indexOf(1), "1×"], [H.indexOf(2), "2×"], [H.indexOf(4), "4×"], [H.indexOf(8), "8×"]]) { const d = document.createElement("span"); d.className = "yt"; d.style.top = (100 * (H.length - 0.5 - j) / H.length) + "%"; d.textContent = txt; plot.appendChild(d); }
+  $("#stackAxis").innerHTML = [100, 300, 1000, 3000].map(hz => `<span style="left:${100 * (binOf(hz) + 0.5) / F}%">${hz >= 1000 ? hz / 1000 + "k" : hz}</span>`).join("");
+  // comb bars at candidate
+  $("#combAt").textContent = (C.ref.kind && ref > 0 ? "the reference pitch, " : `the ${kind} salience peak, `) + fmtHz(D.freqs[clamp(cand, 0, F - 1)]);
+  const cb = $("#combBars"); cb.innerHTML = ""; const W = 320, Hh = 130, m = { l: 26, r: 4, t: 6, b: 20 };
+  const vals = H.map((_, j) => st.rows[j][clamp(cand, 0, F - 1)] - st.floor), vmax = Math.max(40, ...vals);
+  const bw = (W - m.l - m.r) / H.length;
+  for (const v of [0, 20, 40, 60, 80]) { if (v > vmax) break; const y = Hh - m.b - v / vmax * (Hh - m.t - m.b); el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: "var(--rule)" }, cb); const tx = el("text", { x: m.l - 4, y: y + 4, "text-anchor": "end", style: "font-size:9px" }, cb); tx.textContent = v; }
+  H.forEach((h, j) => {
+    const v = Math.max(0, vals[j]), y = Hh - m.b - v / vmax * (Hh - m.t - m.b), whole = Number.isInteger(h);
+    el("rect", { x: m.l + j * bw + 2, width: bw - 4, y, height: Hh - m.b - y, fill: whole ? `var(${KIND_VAR[kind]})` : "none", stroke: `var(${whole ? KIND_VAR[kind] : "--ink-3"})`, "stroke-width": 1.2, rx: 1.5 }, cb);
+    const tx = el("text", { x: m.l + j * bw + bw / 2, y: Hh - 6, "text-anchor": "middle", style: "font-size:9px" }, cb); tx.textContent = hLabel(h);
+  });
+  // salience + spectrum lines
+  const sl = $("#salLine"); sl.innerHTML = ""; const W2 = 320, H2 = 120, m2 = { l: 6, r: 6, t: 6, b: 18 };
+  const X = b => m2.l + b / (F - 1) * (W2 - m2.l - m2.r), Y = v => H2 - m2.b - v * (H2 - m2.t - m2.b);
+  for (const hz of [100, 300, 1000, 3000]) { const b = binOf(hz); el("line", { x1: X(b), x2: X(b), y1: m2.t, y2: H2 - m2.b, stroke: "var(--rule)" }, sl); const tx = el("text", { x: X(b), y: H2 - 5, "text-anchor": "middle", style: "font-size:9px" }, sl); tx.textContent = hz >= 1000 ? hz / 1000 + "k" : hz; }
+  const smax = Math.max(...st.col), smin = st.floor;
+  el("polyline", { points: Array.from(st.col, (v, b) => `${X(b)},${Y((v - smin) / (smax - smin + 1e-6))}`).join(" "), fill: "none", stroke: "var(--ink-3)", "stroke-width": 1 }, sl);
+  for (const k of ["whistle", "hum"]) el("polyline", { points: sal[k].map((v, b) => `${X(b)},${Y(v)}`).join(" "), fill: "none", stroke: `var(${KIND_VAR[k]})`, "stroke-width": 1.8 }, sl);
+  if (ref > 0) el("line", { x1: X(binOf(ref)), x2: X(binOf(ref)), y1: m2.t, y2: H2 - m2.b, stroke: `var(${KIND_VAR[C.ref.kind]})`, "stroke-dasharray": "3 2" }, sl);
+}
+
+/* ------------------------------------------------------------------ boot + theme */
+function renderAll() { renderArch(); renderScatter(); renderComb(); renderHist(); renderWeights(); renderHistory(); if (C) renderClip(); }
+async function main() {
+  try { D = await (await fetch("data.json")).json(); }
+  catch (e) { $("#hdr-sub").textContent = "Could not load data.json next to this page: " + e.message; return; }
+  renderHeader(); buildStrips(); renderTable();
+  const sel = $("#clipSel");
+  const groups = {}; for (const c of D.clips) (groups[c.label] ||= []).push(c);
+  sel.innerHTML = ["hum", "whistle", "speech", "noise", "silence"].filter(l => groups[l]).map(l => `<optgroup label="${l}">${groups[l].map(c => `<option value="${c.id}">${c.id} · ${c.split} · ${(c.T / D.fps).toFixed(0)} s</option>`).join("")}</optgroup>`).join("");
+  sel.addEventListener("change", () => loadClip(sel.value));
+  renderAll();
+  const firstHum = D.clips.find(c => c.label === "hum" && c.split !== "train") || D.clips[0];
+  await loadClip(firstHum.id);
+  const rerender = () => renderAll();
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", rerender);
+  new MutationObserver(rerender).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(renderScatter, 150); });
+}
+main();
+</script>

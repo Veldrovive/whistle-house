@@ -26,12 +26,22 @@ the mean over classes, so checkpoint selection and the overfitting signals work 
 When fine-tuning (``init_from``) the starting checkpoint is validated first as epoch 0 and is
 the initial "best", so a fine-tune can never return something worse on ``val`` than it started
 from. ``patience`` stops a run once ``val`` F1 has not improved for that many validations.
+
+Resuming: after every validation the full training state (model, optimiser, LR schedule,
+epoch, best F1, patience counter, history) is written atomically to
+``models/<name>.resume.ckpt``, next to the best checkpoint ``<name>.pt``. ``train(...,
+resume=True)`` (CLI ``--resume``) continues from it after a crash or a stop, at the next
+epoch, and refuses if the run's settings changed; a run that already finished is not
+repeated. The example stream gets a new seed per resume so data is not replayed. Validation
+sets are rebuilt from the seed, so they are the same as before as long as ``data/`` and the
+external datasets have not changed.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -58,6 +68,7 @@ from whistle_house.ml.model import (
     log_bins_per_octave,
     save_checkpoint,
 )
+from whistle_house.ml.tracking import Tracker
 from whistle_house.pipeline import PipelineSpec
 from whistle_house.settings import Paths, external_root
 
@@ -85,6 +96,9 @@ class TrainConfig:
     init_from: str | None = None  # checkpoint to fine-tune from (path or name in models/)
     patience: int = 0  # stop after this many validations without a better val F1 (0 = never)
     workers: int = 4  # example-generation processes (0 = in the main process)
+    wandb_project: str | None = None  # log to this Weights & Biases project (ml/tracking.py)
+    wandb_group: str | None = None  # wandb group (warmstart: pretrain + fine-tune together)
+    log_every: int = 10  # wandb: log the training loss every this many steps
 
 
 class _ExampleStream(torch.utils.data.IterableDataset):
@@ -189,26 +203,67 @@ def _resolve_checkpoint(ref: str, paths: Paths) -> Path:
     return p
 
 
-def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path:
+# TrainConfig fields that may differ when a run is resumed (they don't change what is learned)
+_RESUME_FREE = {"device", "workers", "patience", "wandb_project", "wandb_group", "log_every"}
+
+
+def _atomic_save(obj, path: Path) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _load_resume(path: Path, frontend: dict, cfg: TrainConfig) -> dict:
+    rs = torch.load(path, map_location="cpu", weights_only=False)
+    if rs["frontend"] != frontend:
+        raise ValueError(f"{path}: the run was started on a different front-end; can't resume")
+    old, new = rs["status"]["config"], asdict(cfg)
+    changed = sorted(k for k in new if k not in _RESUME_FREE and old.get(k) != new[k])
+    if changed:
+        diff = ", ".join(f"{k}: {old.get(k)!r} -> {new[k]!r}" for k in changed)
+        raise ValueError(f"{path}: settings differ from the interrupted run ({diff})")
+    return rs
+
+
+def train(
+    spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig, resume: bool = False
+) -> Path:
+    """Train ``name`` and return its best checkpoint. ``resume``: continue an interrupted run
+    from its resume state if there is one (else start fresh); return at once if it finished."""
     torch.manual_seed(cfg.seed)
     status_path = paths.models / f"{name}.json"
     ckpt_path = paths.models / f"{name}.pt"
+    state_path = paths.resume_state(name)
     paths.models.mkdir(parents=True, exist_ok=True)
     frontend = spec.frontend_dict()
-    status = {
-        "name": name,
-        "state": "preparing",
-        "pipeline": spec.name,
-        "frontend": frontend,
-        "config": asdict(cfg),
-        "history": [],
-        "started": time.time(),
-    }
+    rs = _load_resume(state_path, frontend, cfg) if resume and state_path.exists() else None
+    if rs is not None and rs["done"]:
+        log.info("%s already finished (%s); nothing to resume", name, state_path)
+        return ckpt_path
+    if rs is not None:
+        status = rs["status"]
+        status["state"] = "preparing"
+        status["config"] = asdict(cfg)
+        status.setdefault("resumed", []).append({"epoch": rs["epoch"], "time": time.time()})
+        status.pop("error", None)
+        log.info("resuming %s after epoch %d (best f1 %.4f)", name, rs["epoch"], rs["best"])
+    else:
+        state_path.unlink(missing_ok=True)  # a fresh run: an older run's state must not be resumed
+        status = {
+            "name": name,
+            "state": "preparing",
+            "pipeline": spec.name,
+            "frontend": frontend,
+            "config": asdict(cfg),
+            "history": [],
+            "started": time.time(),
+        }
 
     def write_status() -> None:
         status_path.write_text(json.dumps(status, indent=2))
 
     write_status()
+    tracker = Tracker()  # wandb, once the model is built (off without cfg.wandb_project)
     try:
         init = None  # (path, model, checkpoint) when fine-tuning
         if cfg.init_from:
@@ -291,7 +346,15 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
 
         dev = _pick_device(cfg.device)
         status["device"] = str(dev)
-        if init is not None:
+        if rs is not None:  # same architecture and normalisation as the interrupted run
+            arch = dict(rs["arch"])
+            for key in ("dilations", "dilations_f", "classes", "harmonics"):
+                if key in arch:
+                    arch[key] = tuple(arch[key])
+            model = WhistleNet(WhistleNetConfig(**arch))
+            model.load_state_dict(rs["model"])
+            norm = tuple(rs["norm"])
+        elif init is not None:
             init_path, model, ck = init
             norm = (ck["norm"]["mean"], ck["norm"]["std"])
             status["init_from"] = str(init_path)
@@ -304,8 +367,11 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
             model = WhistleNet(WhistleNetConfig(n_bins=len(freqs), **arch))
         model = model.to(dev)
         model.train()
+        start_epoch = rs["epoch"] if rs is not None else 0
 
-        stream = _ExampleStream(frontend, train_src, gcfg, cfg.batch_size, cfg.seed, paths.root)
+        # a resumed run draws new examples rather than replaying the ones it already saw
+        stream_seed = cfg.seed + 1_000_003 * start_epoch
+        stream = _ExampleStream(frontend, train_src, gcfg, cfg.batch_size, stream_seed, paths.root)
         loader = torch.utils.data.DataLoader(
             stream,
             batch_size=None,
@@ -320,10 +386,60 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
         sched = torch.optim.lr_scheduler.OneCycleLR(
             opt, max_lr=cfg.lr, total_steps=cfg.epochs * cfg.steps_per_epoch
         )
+        best, stale = -1.0, 0
+        if rs is not None:
+            opt.load_state_dict(rs["opt"])
+            sched.load_state_dict(rs["sched"])
+            best, stale = rs["best"], rs["stale"]
+            torch.set_rng_state(rs["torch_rng"])
         status["state"] = "training"
         status["params"] = sum(p.numel() for p in model.parameters())
+        prev = status.get("wandb") or {}
+        tracker = Tracker.start(
+            cfg.wandb_project,
+            name,
+            cfg.wandb_group,
+            {
+                **asdict(cfg),
+                "pipeline": spec.name,
+                "frontend": frontend,
+                "classes": list(classes),
+                "params": status["params"],
+                "data": status["data"],
+            },
+            run_id=prev.get("id") if prev.get("project") == cfg.wandb_project else None,
+        )
+        status["wandb"] = tracker.info or prev or None
         write_status()
-        best, stale = -1.0, 0
+        spe = cfg.steps_per_epoch
+
+        def log_validation(metrics: dict) -> None:
+            e = metrics["epoch"]
+            tracker.log(e * spe, {k: v for k, v in metrics.items() if k != "epoch"}, "val/")
+            tracker.log(e * spe, {"epoch": e})
+            if status.get("best") is metrics:
+                tracker.summary({"best_f1": best, "best_epoch": e})
+
+        def save_state(epoch: int, done: bool = False) -> None:
+            """Everything needed to continue after ``epoch`` (atomic: a crash mid-write keeps
+            the previous state)."""
+            _atomic_save(
+                {
+                    "epoch": epoch,
+                    "done": done,
+                    "arch": asdict(model.cfg),
+                    "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    "opt": opt.state_dict(),
+                    "sched": sched.state_dict(),
+                    "best": best,
+                    "stale": stale,
+                    "norm": list(norm),
+                    "frontend": frontend,
+                    "torch_rng": torch.get_rng_state(),
+                    "status": status,
+                },
+                state_path,
+            )
 
         def keep_if_best(metrics: dict) -> bool:
             nonlocal best
@@ -341,16 +457,19 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
             model.to(dev)
             return True
 
-        if cfg.init_from:  # baseline: the checkpoint we start from, before any update
+        if cfg.init_from and rs is None:  # baseline: the checkpoint we start from, untouched
             metrics = validate()
             metrics.update(epoch=0, loss=None, seconds=0.0)
             status["history"].append(metrics)
             log.info("epoch 0 (init checkpoint) %s", metrics)
             keep_if_best(metrics)
+            log_validation(metrics)
             write_status()
-        for epoch in range(cfg.epochs):
+            save_state(0)
+        stopped = cfg.patience and stale >= cfg.patience  # resumed after its last epoch
+        for epoch in range(start_epoch, 0 if stopped else cfg.epochs):
             t0, losses = time.time(), []
-            for _ in range(cfg.steps_per_epoch):
+            for i in range(cfg.steps_per_epoch):
                 x, f0 = next(batches)
                 x, f0 = x.numpy(), f0.numpy()
                 pres_t, sal_t = _targets(f0, freqs)
@@ -369,11 +488,24 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
                 opt.step()
                 sched.step()
                 losses.append(loss.item())
+                gstep = epoch * spe + i + 1
+                if gstep % cfg.log_every == 0:
+                    tracker.log(
+                        gstep,
+                        {
+                            "loss": np.mean(losses[-cfg.log_every :]),
+                            "loss_presence": loss_p.item(),
+                            "loss_salience": loss_s.item(),
+                            "lr": sched.get_last_lr()[0],
+                        },
+                        "train/",
+                    )
             metrics = validate()
             metrics.update(epoch=epoch + 1, loss=float(np.mean(losses)), seconds=time.time() - t0)
             status["history"].append(metrics)
             log.info("epoch %d %s", epoch + 1, metrics)
             stale = 0 if keep_if_best(metrics) else stale + 1
+            log_validation(metrics)
             if cfg.patience and stale >= cfg.patience:
                 status["stopped_early"] = epoch + 1
                 log.info(
@@ -381,15 +513,19 @@ def train(spec: PipelineSpec, paths: Paths, name: str, cfg: TrainConfig) -> Path
                     stale,
                     status["best"]["epoch"],
                 )
-                write_status()
                 break
             write_status()
+            save_state(epoch + 1)
         status["state"] = "done"
-    except Exception as e:
-        status["state"] = "failed"
-        status["error"] = repr(e)
+        status["finished"] = time.time()
         write_status()
+        save_state(status.get("stopped_early", cfg.epochs), done=True)
+        tracker.finish()
+    except BaseException as e:  # incl. Ctrl-C: the wandb run is marked failed, resume continues it
+        tracker.finish(failed=True)
+        if isinstance(e, Exception):
+            status["state"] = "failed"
+            status["error"] = repr(e)
+            write_status()
         raise
-    status["finished"] = time.time()
-    write_status()
     return ckpt_path

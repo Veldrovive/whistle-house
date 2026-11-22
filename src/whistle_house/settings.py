@@ -86,6 +86,15 @@ class Paths:
     def models(self) -> Path:
         return self.root / "models"
 
+    def resume_state(self, model: str) -> Path:
+        """Training state an interrupted run of ``model`` resumes from (``ml/train.py``)."""
+        return self.models / f"{model}.resume.ckpt"
+
+    @property
+    def reports(self) -> Path:
+        """Model reports (``whistle-house inspect-model``): ``reports/<model>/index.html``."""
+        return self.root / "reports"
+
     @property
     def noise_profiles(self) -> Path:
         return self.root / "noise_profiles"

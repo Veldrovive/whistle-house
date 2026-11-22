@@ -81,6 +81,7 @@ class TrainBody(BaseModel):
     val_examples: int = 64  # size of the fixed validation set
     patience: int = 0  # stop after N validations without a better val F1 (0 = never)
     arch: str = "small"  # ml/model.ARCHS; ignored when fine-tuning (init_from)
+    wandb_project: str | None = None  # log to this Weights & Biases project (wandb extra)
 
 
 class NoiseProfileBody(BaseModel):
@@ -547,9 +548,66 @@ def create_app(
             proc = S.training.get(st["name"])
             st["running"] = proc is not None and proc.poll() is None
             st["has_checkpoint"] = (S.paths.models / f"{st['name']}.pt").exists()
+            st["can_resume"] = (
+                not st["running"]
+                and st.get("state") != "done"
+                and S.paths.resume_state(st["name"]).exists()
+            )
             st.pop("frontend", None)
+            st["report"] = _report_status(st["name"])
             out.append(st)
         return out
+
+    # Model reports (`whistle-house inspect-model`, ml/inspect.py): built in a subprocess into
+    # <data>/reports/<model>/, served as static files under /api/models/<model>/report/.
+    reports: dict[str, subprocess.Popen] = {}
+
+    def _report_status(name: str) -> dict:
+        d = S.paths.reports / name
+        proc = reports.get(name)
+        running = proc is not None and proc.poll() is None
+        failed = proc is not None and not running and proc.returncode != 0
+        idx = d / "index.html"
+        st: dict = {
+            "running": running,
+            "exists": idx.exists() and (d / "data.json").exists(),
+            "built": (d / "data.json").stat().st_mtime if (d / "data.json").exists() else None,
+            "failed": failed,
+        }
+        if failed:
+            lp = S.paths.reports / f"{name}.log"
+            st["log"] = lp.read_text()[-3000:] if lp.exists() else ""
+        return st
+
+    @app.post("/api/models/{name}/report")
+    def build_model_report(name: str):
+        """(Re)build the layer-by-layer report of a whistle + hum checkpoint."""
+        proc = reports.get(name)
+        if proc is not None and proc.poll() is None:
+            raise HTTPException(409, "report already being built")
+        if not (S.paths.models / f"{name}.pt").exists():
+            raise HTTPException(404, f"no checkpoint {name}.pt")
+        cmd = [
+            sys.executable,
+            "-m",
+            "whistle_house.cli",
+            "--data",
+            str(S.paths.root),
+            "inspect-model",
+            name,
+        ]
+        S.paths.reports.mkdir(parents=True, exist_ok=True)
+        log_path = S.paths.reports / f"{name}.log"
+        reports[name] = subprocess.Popen(cmd, stdout=log_path.open("w"), stderr=subprocess.STDOUT)
+        return {"ok": True, "cmd": cmd}
+
+    @app.get("/api/models/{name}/report/{path:path}", include_in_schema=False)
+    def model_report_file(name: str, path: str = ""):
+        root = (S.paths.reports / name).resolve()
+        f = (root / (path or "index.html")).resolve()
+        if root not in f.parents or not f.is_file():
+            raise HTTPException(404, "no such report file (build the report first)")
+        return FileResponse(f)
 
     @app.post("/api/models/train")
     def train_model(body: TrainBody):
@@ -589,9 +647,71 @@ def create_app(
             cmd += ["--external", ",".join(body.external)]
         if body.init_from:
             cmd += ["--init-from", body.init_from]
+        if body.wandb_project:
+            cmd += ["--wandb-project", body.wandb_project]
         log_path = S.paths.models / f"{body.name}.log"
         S.training[body.name] = subprocess.Popen(
             cmd, stdout=log_path.open("w"), stderr=subprocess.STDOUT
+        )
+        return {"ok": True, "cmd": cmd}
+
+    @app.post("/api/models/{name}/resume")
+    def resume_training(name: str):
+        """Continue an interrupted run with the settings it was started with."""
+        proc = S.training.get(name)
+        if proc is not None and proc.poll() is None:
+            raise HTTPException(409, "already training")
+        status_path = S.paths.models / f"{name}.json"
+        if not status_path.exists() or not S.paths.resume_state(name).exists():
+            raise HTTPException(404, f"no interrupted run {name!r} to resume")
+        st = json.loads(status_path.read_text())
+        c = st["config"]
+        cmd = [
+            sys.executable,
+            "-m",
+            "whistle_house.cli",
+            "--data",
+            str(S.paths.root),
+            "train-detector",
+            "--resume",
+            "--pipeline",
+            st["pipeline"],
+            "--name",
+            name,
+            "--epochs",
+            str(c["epochs"]),
+            "--steps-per-epoch",
+            str(c["steps_per_epoch"]),
+            "--batch-size",
+            str(c["batch_size"]),
+            "--lr",
+            str(c["lr"]),
+            "--seed",
+            str(c["seed"]),
+            "--mix",
+            c["mix"],
+            "--workers",
+            str(c["workers"]),
+            "--val-examples",
+            str(c["val_examples"]),
+            "--patience",
+            str(c["patience"]),
+            "--arch",
+            c.get("arch", "small"),
+            "--device",
+            c.get("device", "auto"),
+        ]
+        if c.get("classes"):
+            cmd += ["--classes", ",".join(c["classes"])]
+        if c.get("external"):
+            cmd += ["--external", ",".join(c["external"])]
+        if c.get("init_from"):
+            cmd += ["--init-from", c["init_from"]]
+        if c.get("wandb_project"):  # continues the same wandb run
+            cmd += ["--wandb-project", c["wandb_project"]]
+        log_path = S.paths.models / f"{name}.log"
+        S.training[name] = subprocess.Popen(
+            cmd, stdout=log_path.open("a"), stderr=subprocess.STDOUT
         )
         return {"ok": True, "cmd": cmd}
 

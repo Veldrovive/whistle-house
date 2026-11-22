@@ -134,3 +134,45 @@ def test_written_tune_roundtrip_and_match(tmp_path):
         (match,) = res["matches"]
         assert match["tune_name"] == "call" and len(match["meta"]["notes"]) == 4
         assert abs(match["meta"]["key"] - 24) < 0.5
+
+
+def test_resume_training_endpoint(tmp_path, monkeypatch):
+    import json
+
+    import whistle_house.server.app as app_mod
+
+    paths = Paths(tmp_path)
+    app = create_app(paths, live=False)
+    started = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            started.append(cmd)
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(app_mod.subprocess, "Popen", FakeProc)
+    with TestClient(app) as c:
+        assert c.post("/api/models/hn/resume").status_code == 404
+        paths.models.mkdir(parents=True, exist_ok=True)
+        config = {
+            "epochs": 40, "steps_per_epoch": 500, "batch_size": 32, "lr": 0.002, "seed": 0,
+            "mix": "pretrain", "workers": 8, "val_examples": 512, "patience": 0,
+            "arch": "harmonic", "device": "auto", "classes": [], "init_from": None,
+            "external": ["musan", "esc50"],
+        }  # fmt: skip
+        status = {"name": "hn", "state": "failed", "pipeline": "hum-log", "config": config}
+        (paths.models / "hn.json").write_text(json.dumps({**status, "history": []}))
+        assert not c.get("/api/models").json()[0]["can_resume"]  # no resume state yet
+        paths.resume_state("hn").write_bytes(b"x")
+        assert c.get("/api/models").json()[0]["can_resume"]
+        assert c.post("/api/models/hn/resume").status_code == 200
+    cmd = started[0]
+    i = cmd.index("train-detector")
+    assert "--resume" in cmd and cmd[cmd.index("--pipeline") + 1] == "hum-log"
+    assert cmd[cmd.index("--external") + 1] == "musan,esc50" and "--init-from" not in cmd
+    assert cmd[cmd.index("--steps-per-epoch") + 1] == "500" and i > 0

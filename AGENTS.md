@@ -43,7 +43,9 @@ audio ─▶ Transform ─▶ [Filter, Filter, …] ─▶ WhistleDetector ─�
 
 ```
 AGENTS.md            this file (CLAUDE.md just imports it)
-pyproject.toml       python package (uv). extras: ml (torch). dev group: pytest, ruff, librosa
+scripts/train-forever.sh  rerun a training command with --resume until it finishes
+pyproject.toml       python package (uv). extras: ml (torch), wandb (training machine only).
+                     dev group: pytest, ruff, librosa
 mise.toml            node version for the manager (managed by mise)
 src/whistle_house/
   types.py           FrequencyAxis, FrameBlock, WhistleEvent, DetectorOutput, TuneMatch
@@ -80,8 +82,11 @@ src/whistle_house/
     hum_labels.py    pYIN hum pitch labels (offline, librosa), harmonic-level profile
   external/          external datasets: base.py (download/prepare/manifest framework),
                      datasets.py (mlend_whistles, mlend_hums, musan, esc50, demand)
-  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic),
-                     train.py (training loop, per-class metrics, status json)
+  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep),
+                     train.py (training loop, per-class metrics, status json, resume state),
+                     tracking.py (optional Weights & Biases logging),
+                     inspect.py + inspect_page.html (layer-by-layer report of a whistle + hum
+                     checkpoint on the recordings, see "Model report" below)
   outputs/           output types (log, webhook, home_assistant_event) + OutputStore (data/outputs.json)
   server/            app.py (FastAPI /api + /ws/live, serves manager/dist), engine.py (LiveEngine)
 manager/             Vite + React + TS manager website
@@ -95,9 +100,10 @@ manager/             Vite + React + TS manager website
 tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data,
                      augmentation labels, server API, harmonic model (test_harmonic.py),
                      overtone rejection (test_overtones.py), written tunes against simulated
-                     performances (test_score_align.py)
+                     performances (test_score_align.py), model report (test_inspect.py)
 .env.example         settings template; copy to .env (gitignored)
-data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines)
+data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines,
+                     reports/<model>/ = model reports)
 ```
 
 ## Commands
@@ -116,12 +122,16 @@ uv run whistle-house analyze clip.wav --pipeline default
 uv run whistle-house import *.wav --label speech       # bulk-add to the dataset
 uv run whistle-house train-detector --name whistlenet --device auto
 uv run whistle-house train-detector --pipeline hum-log --arch harmonic --name humnet  # + hums
+uv run whistle-house train-detector ... --resume   # same command again: continue a crashed run
+uv run whistle-house train-detector ... --wandb-project whistle-house   # + Weights & Biases
 uv run whistle-house datasets list             # external datasets + status
 uv run whistle-house datasets fetch all        # training machine only (refuses on a Pi)
 uv run whistle-house warmstart                 # fetch -> pretrain -> fine-tune (see below)
 uv run whistle-house noise-profile create room --add   # profile from all 'silence' recordings,
                                                # + add a spectral_gate to the default pipeline
 uv run whistle-house hum-labels                # pYIN pitch + harmonic profile of every 'hum' clip
+uv run whistle-house inspect-model humnet      # -> data/reports/humnet/index.html (~1 min,
+                                               # ~1.7 GB peak; Models page: "Build report")
 
 # manager (node via mise: `mise install` once; prefix with `mise exec --` if mise isn't activated)
 cd manager && npm install
@@ -146,6 +156,10 @@ tmux send-keys -t whistle-house:server C-c                                    # 
                                                                               # start line again to restart
 tmux attach -t whistle-house                                                  # watch it yourself
 ```
+
+Long training runs go in their own window of the same session (e.g. `train`), run under
+`scripts/train-forever.sh`, which reruns the command with `--resume` after a crash (see
+"Resuming" below).
 
 The window holds a shell and the server is typed into it, so a crash leaves the traceback
 readable in the pane. Restart after backend changes; say in your report if you restarted it
@@ -323,7 +337,10 @@ with different flags than it had (look at the pane for the last command line).
   (140 ms) of lookahead. `tests/test_harmonic.py` pins the alignment on the real front end.
 * **Model sizes** (`ml/model.ARCHS`, `--arch`, the "model" select on the Models page): `small`
   is the whistle-only Pi model above; `harmonic` is the whistle + hum model (cheap enough for
-  the Pi: about the cost per chunk that `small` had before streaming was made incremental). `large` (about 190k params, frequency dilation, 16 frames of
+  the Pi: about the cost per chunk that `small` had before streaming was made incremental).
+  `harmonic_deep` is `harmonic` with its block stack twice over (10 blocks, ~63k params,
+  1.45 s time receptive field, same lookahead), about twice the cost per frame; not yet timed
+  on the Pi. `large` (about 190k params, frequency dilation, 16 frames of
   lookahead) is a reference model that shows how well detection can be done with this data;
   it is not meant to be cheap on the Pi. A lookahead model is delayed, not non-causal: the
   `learned` detector reports its events and scores `lookahead` frames late and pads the future
@@ -332,6 +349,23 @@ with different flags than it had (look at the pane for the last command line).
   architecture.
 
 ## Training-machine workflow (warm start)
+
+**Resuming.** After every validation `ml/train.py` writes the whole training state (model,
+optimiser, LR schedule, epoch, best F1, patience count, history) atomically to
+`data/models/<name>.resume.ckpt`; the best model `<name>.pt` is also written atomically. Rerun
+the same command with `--resume` and it continues at the next epoch (it refuses if settings
+other than device / workers / patience / wandb changed; `warmstart --resume` skips a stage
+that already finished). A run started without `--resume` deletes the old state. The manager's
+Models page has a Resume button for interrupted runs. `scripts/train-forever.sh <cmd...>`
+reruns a command with `--resume` until it exits cleanly (max `MAX_TRIES`, default 20), and on
+macOS holds `caffeinate` so the Mac doesn't idle-sleep. Closing a MacBook's lid still sleeps it:
+training pauses, and the DataLoader usually dies on wake ("Shared memory manager connection has
+timed out"); the retry resumes it, losing the epoch in progress.
+
+**Weights & Biases** (optional): `uv sync --extra ml --extra wandb`, `uv run wandb login`
+once, then `--wandb-project <project>` (or `WHISTLE_HOUSE_WANDB_PROJECT` in `.env`). Charts are
+against `global_step` (optimiser steps); a resumed run continues the same wandb run; warmstart
+groups its pretrain + fine-tune runs under `--name`.
 
 ```bash
 git clone <repo> && cd whistle-house && uv sync --extra ml
@@ -357,12 +391,34 @@ what a pipeline reports (e.g. `["whistle"]` to ignore hums). Re-run only the fin
 step as more mic data is collected. To add a dataset: subclass `ExternalDataset` in
 `external/datasets.py` (`download`, `iter_sources`) and decorate with `@register_dataset`.
 
+## Model report (`inspect-model`)
+
+For whistle + hum (`harmonic` arch) checkpoints. Runs the checkpoint over every recording
+(events through the real streaming pipeline, internals through a mirror of
+`WhistleNet.forward` that `tests/test_inspect.py` pins to the model) and writes a static page:
+headline numbers, the architecture, a per-recording score table, the decision space (the
+presence head is linear, so the two presence logits per frame are exactly what it decides
+on), the harmonic-stack input at the candidate pitch (hums vs whistles vs speech frames that
+fire as hum or don't), per-view attributions of the presence logits, block-1 weights per
+harmonic view, a pitch-error histogram against the reference labels, and the training curves.
+Its clip explorer has every stage on a shared time axis for all hum and whistle clips and a
+sample of the rest (cut to 20 s), with a frame inspector that recomputes the harmonic stack
+of the hovered frame. References: pYIN for hums, the strict `peak_tracker` labeller for
+whistles. Served by the manager at `/api/models/<name>/report/index.html`. First run
+(`humnet-test`, 1,000 steps): hums and whistles ~99% recall, no kind confusion, no octave
+errors; speech fires as hum on ~12% of frames because voiced speech also forms a comb in the
+stack (~14 dB harmonics over gaps on the frames that fire, vs ~30 dB on hums).
+
 ## Roadmap (next steps)
 
-* Hums: the `harmonic` model is built but has only been smoke-tested (up to 500 steps on mic +
-  synthetic data: hums, whistles, noise and silence came out right, `overtone_rate` reached 0,
-  speech still raised some false hum notes). Next: the real warm start (external data), then judge it on
-  `hum_false_positive_rate` against speech. Open questions: does singing count as a hum
+* Hums: two full warm starts on the same data (`--pipeline hum-log`): `humnet` (`harmonic`)
+  and `humnet-deep` (`harmonic_deep`). Fine-tuned val F1 0.925 vs 0.933 (hum F1 0.927 vs
+  0.941), ~99% recall on the mic hums and whistles for both, no kind confusion or octave
+  errors. Speech still fires as hum: on the two held-out speech clips (15 s) 10.1% of frames
+  for `humnet`, 5.1% for `humnet-deep`; on train-split speech 1.2% vs 0.3%. Train-split speech
+  is also a training interferer (the 23 mic negatives are ~30% of interferer draws, most of
+  them the owner's speech), so only held-out speech counts. Next: record several minutes of
+  held-out speech to measure this properly; time `harmonic_deep` on the Pi. Open questions: does singing count as a hum
   (today it is neither class; MUSAN music is an interferer); sustained instrument notes are
   harmonic combs too; re-record hums on the Pi's USB mic.
 

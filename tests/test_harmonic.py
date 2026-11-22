@@ -115,6 +115,34 @@ def test_harmonic_model_streams_and_keeps_old_models_unchanged():
     assert {k.split(".")[0] for k in old.state_dict()} == {"blocks", "salience", "presence"}
 
 
+def test_deep_harmonic_model_streams_with_twice_the_context():
+    from whistle_house.ml.model import ARCHS, WhistleNet, WhistleNetConfig, log_bins_per_octave
+    from whistle_house.stages.transforms.stft import log_frequencies
+
+    freqs = log_frequencies(60, 4000, 24)
+    bpo = log_bins_per_octave(freqs)
+    deep = WhistleNet(
+        WhistleNetConfig(n_bins=len(freqs), bins_per_octave=bpo, **ARCHS["harmonic_deep"])
+    )
+    base = WhistleNet(WhistleNetConfig(n_bins=len(freqs), bins_per_octave=bpo, **ARCHS["harmonic"]))
+    assert len(deep.blocks) == 2 * len(base.blocks) and deep.receptive_field == 125
+    n_deep, n_base = (sum(p.numel() for p in m.parameters()) for m in (deep, base))
+    assert 1.8 * n_base < n_deep < 2.1 * n_base  # ~60k vs ~31k
+    torch.manual_seed(1)
+    deep.eval()
+    for blk in deep.blocks:
+        torch.nn.init.normal_(blk.ctx.weight, std=0.2)
+    x = torch.randn(1, 160, len(freqs))  # longer than the receptive field
+    with torch.no_grad():
+        pres, sal = deep.forward_causal(x)
+        state, parts = deep.init_state(), []
+        for i in range(0, 160, 11):
+            p, s, state = deep.forward_stream(x[:, i : i + 11], state)
+            parts.append((p, s))
+    assert torch.allclose(torch.cat([p for p, _ in parts], 1), pres, atol=1e-5)
+    assert torch.allclose(torch.cat([s for _, s in parts], 1), sal, atol=1e-5)
+
+
 def test_synth_hum_is_a_labelled_harmonic_stack():
     from whistle_house.data.hum_labels import harmonic_levels, hum_f0
 

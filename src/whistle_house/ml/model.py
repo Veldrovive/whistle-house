@@ -47,11 +47,13 @@ anywhere else (broadband speech energy, a stronger comb elsewhere).
 ``ARCHS`` names the architectures training can build. ``small`` is the whistle-only Pi model.
 ``large`` is a whistle-only reference model for "how well can this be done". ``harmonic`` is the
 whistle + hum model described above; it needs a log-frequency front end (``stft_log``).
+``harmonic_deep`` is the same with twice the blocks (twice the time receptive field).
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -98,6 +100,18 @@ ARCHS: dict[str, dict] = {
     "harmonic": {
         "channels": 24,
         "dilations": (1, 2, 4, 8, 16),
+        "lookahead": 12,
+        "classes": ("whistle", "hum"),
+        "harmonics": HARMONIC_GRID,
+        "freq_context": True,
+    },
+    # ``harmonic`` twice as deep: two dilation cycles, 10 blocks, ~60k params. Time receptive
+    # field 125 frames (1.45 s) + the same 12 frames of lookahead, about twice the cost per
+    # frame. For the open problem of the harmonic model: voiced speech has a real comb at its
+    # pitch, so only how it moves over time (over several syllables) tells it from a hum.
+    "harmonic_deep": {
+        "channels": 24,
+        "dilations": (1, 2, 4, 8, 16, 1, 2, 4, 8, 16),
         "lookahead": 12,
         "classes": ("whistle", "hum"),
         "harmonics": HARMONIC_GRID,
@@ -249,6 +263,7 @@ def save_checkpoint(
     path: Path, model: WhistleNet, norm: tuple[float, float], frontend: dict, meta: dict
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")  # write then rename: a crash never leaves half a file
     torch.save(
         {
             "arch": asdict(model.cfg),
@@ -257,8 +272,9 @@ def save_checkpoint(
             "frontend": frontend,  # {"sample_rate", "transform": {...}, "filters": [...]}
             "meta": meta,
         },
-        path,
+        tmp,
     )
+    os.replace(tmp, path)
 
 
 def load_checkpoint(path: Path) -> tuple[WhistleNet, dict]:

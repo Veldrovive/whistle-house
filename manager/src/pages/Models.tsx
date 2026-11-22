@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, modelReportUrl, type ModelStatus } from '../api'
 import { useAction, useLoad } from '../lib/hooks'
 
 const METRICS = ['loss', 'f1', 'precision', 'recall', 'false_positive_rate', 'pitch_acc_1st']
@@ -27,6 +27,37 @@ const CURVES = [
 ]
 
 type History = Record<string, number | null>[]
+
+/** Layer-by-layer report of a whistle + hum checkpoint on every recording (ml/inspect.py):
+ * build it (about a minute for ~40 clips), then open it in a new tab. */
+function ReportControls({ m, onChange }: { m: ModelStatus; onChange: () => void }) {
+  const act = useAction()
+  const r = m.report
+  if (r?.running) return <span className="muted small">building report…</span>
+  return (
+    <>
+      {r?.exists && (
+        <a
+          className="small"
+          href={modelReportUrl(m.name)}
+          target="_blank"
+          rel="noreferrer"
+          title={r.built ? `built ${new Date(r.built * 1000).toLocaleString()}` : undefined}
+        >
+          Report
+        </a>
+      )}
+      <button
+        disabled={act.busy}
+        title="Run this checkpoint over every recording and show what each layer does (harmonic stack, blocks, heads, decision space)"
+        onClick={() => act.run(() => api.buildModelReport(m.name)).then(onChange)}
+      >
+        {r?.exists ? 'Rebuild report' : 'Build report'}
+      </button>
+      {act.error && <span className="error small">{act.error}</span>}
+    </>
+  )
+}
 
 /** F1 per validation: val flat or falling while mic-train keeps rising = overfitting. */
 function ValidationCurves({ history, bestEpoch }: { history: History; bestEpoch?: number | null }) {
@@ -93,13 +124,14 @@ export function Models() {
     val_examples: 64,
     patience: 0,
     arch: 'small',
+    wandb_project: '',
   })
   const prepared = datasets.data?.datasets.filter((d) => d.prepared) ?? []
   const [logFor, setLogFor] = useState<string | null>(null)
   const [log, setLog] = useState('')
   const act = useAction()
 
-  const anyRunning = models.data?.some((m) => m.running)
+  const anyRunning = models.data?.some((m) => m.running || m.report?.running)
   const reloadModels = models.reload
   useEffect(() => {
     if (!anyRunning && !logFor) return
@@ -158,13 +190,23 @@ export function Models() {
               ))}
             </select>
           </label>
-          <label title="small: the ~7k-parameter causal whistle model for the Pi. large: a ~190k-parameter whistle reference model with lookahead, to see how well detection can be done. harmonic: whistles + hums (~31k parameters); needs a pipeline with a log-frequency transform (stft_log) and no noise_floor filter, which swallows held hums. Ignored when fine-tuning (the checkpoint's architecture is kept).">
+          <label title="small: the ~7k-parameter causal whistle model for the Pi. large: a ~190k-parameter whistle reference model with lookahead, to see how well detection can be done. harmonic: whistles + hums (~31k parameters); needs a pipeline with a log-frequency transform (stft_log) and no noise_floor filter, which swallows held hums. harmonic_deep: the same with twice the blocks (~60k parameters, 1.45 s of context instead of 0.73 s), about twice the cost. Ignored when fine-tuning (the checkpoint's architecture is kept).">
             model{' '}
             <select value={form.arch} onChange={(e) => setForm({ ...form, arch: e.target.value })} disabled={!!form.init_from}>
               <option>small</option>
               <option>large</option>
               <option>harmonic</option>
+              <option>harmonic_deep</option>
             </select>
+          </label>
+          <label title="Also log metrics to this Weights & Biases project (needs `uv sync --extra wandb` and `wandb login` on the machine running the server). Empty = off.">
+            wandb project{' '}
+            <input
+              style={{ width: 110 }}
+              value={form.wandb_project}
+              placeholder="off"
+              onChange={(e) => setForm({ ...form, wandb_project: e.target.value })}
+            />
           </label>
           <label>
             fine-tune from{' '}
@@ -197,7 +239,12 @@ export function Models() {
             onClick={() =>
               act
                 .run(() =>
-                  api.train({ ...form, pipeline: form.pipeline || undefined, init_from: form.init_from || undefined }),
+                  api.train({
+                    ...form,
+                    pipeline: form.pipeline || undefined,
+                    init_from: form.init_from || undefined,
+                    wandb_project: form.wandb_project || undefined,
+                  }),
                 )
                 .then(models.reload)
             }
@@ -263,6 +310,20 @@ export function Models() {
               {m.has_checkpoint ? `checkpoint ${m.name}.pt` : 'no checkpoint'}
             </span>
             {m.running && <button onClick={() => act.run(() => api.stopTraining(m.name)).then(models.reload)}>Stop</button>}
+            {m.can_resume && (
+              <button
+                title={`Continue from the last finished epoch (${m.history.at(-1)?.epoch ?? 0}) with the same settings`}
+                onClick={() => act.run(() => api.resumeTraining(m.name)).then(models.reload)}
+              >
+                Resume
+              </button>
+            )}
+            {m.resumed?.length ? <span className="muted small">resumed {m.resumed.length}×</span> : null}
+            {m.wandb && (
+              <a className="small" href={m.wandb.url} target="_blank" rel="noreferrer">
+                wandb
+              </a>
+            )}
             <button
               onClick={() => {
                 setLogFor(logFor === m.name ? null : m.name)
@@ -271,7 +332,14 @@ export function Models() {
             >
               {logFor === m.name ? 'Hide log' : 'Log'}
             </button>
+            {m.has_checkpoint && m.classes?.includes('hum') && <ReportControls m={m} onChange={models.reload} />}
           </div>
+          {m.report?.failed && (
+            <details className="error small">
+              <summary>Report build failed</summary>
+              <pre style={{ whiteSpace: 'pre-wrap' }}>{m.report.log}</pre>
+            </details>
+          )}
           {m.error && <div className="error">{m.error}</div>}
           {m.data && (
             <div className="muted small">

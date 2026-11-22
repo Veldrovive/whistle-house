@@ -23,3 +23,6 @@ manager/dist/
 .ruff_cache/
 .pytest_cache/
 .claude/
+
+# Weights & Biases local run files (ml/tracking.py)
+wandb/

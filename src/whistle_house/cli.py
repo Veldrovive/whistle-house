@@ -101,6 +101,8 @@ def _train_config(args, **overrides):
             "patience": args.patience,
             "arch": args.arch,
             "classes": _classes(args.classes),
+            "wandb_project": args.wandb_project,
+            "wandb_group": getattr(args, "wandb_group", None),
             **overrides,
         }
     )
@@ -115,7 +117,7 @@ def cmd_train(args) -> None:
     cfg = _train_config(
         args, mix=args.mix, external=_external_list(args.external), init_from=args.init_from
     )
-    path = train(spec, paths, args.name, cfg)
+    path = train(spec, paths, args.name, cfg, resume=args.resume)
     print(f"saved {path}")
 
 
@@ -214,8 +216,14 @@ def cmd_warmstart(args) -> None:
         paths,
         pre_name,
         _train_config(
-            args, mix="pretrain", external=ext, epochs=args.pretrain_epochs, patience=args.patience
+            args,
+            mix="pretrain",
+            external=ext,
+            epochs=args.pretrain_epochs,
+            patience=args.patience,
+            wandb_group=args.name,
         ),
+        resume=args.resume,
     )
 
     classes = _classes(args.classes) or list(ARCHS[args.arch].get("classes", ("whistle",)))
@@ -246,7 +254,9 @@ def cmd_warmstart(args) -> None:
             steps_per_epoch=args.finetune_steps_per_epoch,
             patience=args.finetune_patience,
             lr=args.lr / 4,
+            wandb_group=args.name,
         ),
+        resume=args.resume,
     )
     print(f"\nDone: {paths.models / args.name}.pt (+ .json). Copy both to the Pi's data/models/.")
 
@@ -341,6 +351,25 @@ def cmd_hum_labels(args) -> None:
         )
 
 
+def cmd_inspect_model(args) -> None:
+    """Layer-by-layer report of a whistle + hum checkpoint on the mic recordings."""
+    from whistle_house.data.store import RecordingStore
+    from whistle_house.ml.inspect import build_report
+    from whistle_house.pipeline import PipelineStore
+
+    paths = _paths(args)
+    ck = Path(args.checkpoint)
+    if not ck.exists():
+        ck = paths.models / (ck.name if ck.suffix == ".pt" else f"{ck.name}.pt")
+    if not ck.exists():
+        raise SystemExit(f"checkpoint not found: {args.checkpoint}")
+    base = PipelineStore(paths.pipelines).get(args.pipeline) if args.pipeline else None
+    out = Path(args.out) if args.out else paths.reports / ck.stem
+    build_report(
+        ck, RecordingStore(paths.recordings), out, paths.root, base, args.max_clip_s, print
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whistle-house")
     ap.add_argument("--data", help="data directory (default: $WHISTLE_HOUSE_DATA or ./data)")
@@ -384,7 +413,8 @@ def main(argv: list[str] | None = None) -> None:
             default="small",
             help="model: small (whistle-only Pi model) | large (whistle-only reference model "
             "with lookahead) | harmonic (whistles + hums; needs a log-frequency pipeline such "
-            "as stft_log). Ignored with --init-from, which keeps the checkpoint's architecture",
+            "as stft_log) | harmonic_deep (harmonic with 10 blocks: 1.45 s of context instead "
+            "of 0.73 s). Ignored with --init-from, which keeps the checkpoint's architecture",
         )
         p.add_argument(
             "--classes",
@@ -398,6 +428,18 @@ def main(argv: list[str] | None = None) -> None:
             type=int,
             default=0,
             help="stop after this many validations (epochs) without a better val F1; 0 = never",
+        )
+        p.add_argument(
+            "--wandb-project",
+            default=os.environ.get("WHISTLE_HOUSE_WANDB_PROJECT") or None,
+            help="log metrics to this Weights & Biases project (needs the wandb extra; default: "
+            "$WHISTLE_HOUSE_WANDB_PROJECT, else off)",
+        )
+        p.add_argument(
+            "--resume",
+            action="store_true",
+            help="continue an interrupted run (same command, same settings) from "
+            "models/<name>.resume.ckpt; a stage that already finished is skipped",
         )
 
     p = sub.add_parser("train-detector", help="train the learned detector (needs ml extra)")
@@ -475,6 +517,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--harmonics", type=int, default=8, help="harmonics to profile")
     p.add_argument("--workers", type=int, default=1)
     p.set_defaults(fn=cmd_hum_labels)
+
+    p = sub.add_parser(
+        "inspect-model",
+        help="layer-by-layer report of a whistle + hum checkpoint on the recordings (ml extra)",
+    )
+    p.add_argument("checkpoint", help="model name or .pt path (default dir: <data>/models)")
+    p.add_argument(
+        "--pipeline",
+        help="saved pipeline whose learned-detector params (thresholds) to use; the front end "
+        "always comes from the checkpoint",
+    )
+    p.add_argument("--out", help="output directory (default: <data>/reports/<model>)")
+    p.add_argument("--max-clip-s", type=float, default=20.0, help="seconds shown per clip")
+    p.set_defaults(fn=cmd_inspect_model)
 
     args = ap.parse_args(argv)
     logging.basicConfig(

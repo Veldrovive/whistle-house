@@ -170,9 +170,23 @@ export type ModelStatus = {
   init_from?: string
   error?: string
   device?: string
+  wandb?: { id: string; url: string; project: string } | null // Weights & Biases run, if logged
   params?: number
   running: boolean
   has_checkpoint: boolean
+  // not running, not done, and a resume state exists: POST /resume continues it
+  can_resume: boolean
+  resumed?: { epoch: number; time: number }[] // one entry per resume: the epoch it continued after
+  report: ModelReportStatus
+}
+
+// Layer-by-layer report of a whistle + hum checkpoint (whistle-house inspect-model)
+export type ModelReportStatus = {
+  running: boolean
+  exists: boolean
+  built: number | null // unix time of the last build
+  failed: boolean
+  log?: string // tail of the build log, when it failed
 }
 
 export type DatasetStatus = {
@@ -319,6 +333,7 @@ export const api = {
     val_examples: number
     patience: number
     arch: string
+    wandb_project?: string
   }) => req('POST', '/api/models/train', body),
   datasets: () => req<DatasetsInfo>('GET', '/api/datasets'),
 
@@ -327,8 +342,14 @@ export const api = {
     req<NoiseProfile>('POST', '/api/noise-profiles', body),
   deleteNoiseProfile: (name: string) => req('DELETE', `/api/noise-profiles/${encodeURIComponent(name)}`),
   stopTraining: (name: string) => req('POST', `/api/models/${name}/stop`),
+  // continue an interrupted run with the settings it was started with
+  resumeTraining: (name: string) => req('POST', `/api/models/${name}/resume`),
   modelLog: (name: string) => req<{ log: string }>('GET', `/api/models/${name}/log`),
+  // (re)build a model's report; open it at modelReportUrl when status.report.exists
+  buildModelReport: (name: string) => req('POST', `/api/models/${name}/report`),
 }
+
+export const modelReportUrl = (name: string) => `/api/models/${encodeURIComponent(name)}/report/index.html`
 
 export function decodeBlock(b: EncodedBlock): Float32Array {
   const bin = atob(b.values)
