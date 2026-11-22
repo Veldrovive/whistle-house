@@ -44,6 +44,8 @@ audio ─▶ Transform ─▶ [Filter, Filter, …] ─▶ WhistleDetector ─�
 ```
 AGENTS.md            this file (CLAUDE.md just imports it)
 scripts/train-forever.sh  rerun a training command with --resume until it finishes
+notebook/            lab notebook: one dated markdown file per training run / experiment
+                     (machine, command, trade-offs, results); committed
 pyproject.toml       python package (uv). extras: ml (torch), wandb (training machine only).
                      dev group: pytest, ruff, librosa
 mise.toml            node version for the manager (managed by mise)
