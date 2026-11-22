@@ -80,7 +80,15 @@ def _external_list(value: str | None) -> list[str]:
     if not value:
         return []
     if value == "all":
-        return [d["name"] for d in dataset_status(external_root()) if d["prepared"]]
+        root = external_root()
+        names = [d["name"] for d in dataset_status(root) if d["prepared"]]
+        if not names:
+            raise SystemExit(
+                f"no prepared external datasets under {root}"
+                + ("" if root.exists() else " (the folder does not exist: is the disk mounted?)")
+                + ". Run `whistle-house datasets fetch all`, or name none to train without them"
+            )
+        return names
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
@@ -436,7 +444,8 @@ def main(argv: list[str] | None = None) -> None:
             help="model: small (whistle-only Pi model) | large (whistle-only reference model "
             "with lookahead) | harmonic (whistles + hums; needs a log-frequency pipeline such "
             "as stft_log) | harmonic_deep (harmonic with 10 blocks: 1.45 s of context instead "
-            "of 0.73 s). Ignored with --init-from, which keeps the checkpoint's architecture",
+            "of 0.73 s) | harmonic_long (12 blocks, 2.9 s of context, 0.37 s of lookahead "
+            "instead of 0.14 s; trains on 4.5 s windows). Ignored with --init-from, which keeps the checkpoint's architecture",
         )
         p.add_argument(
             "--classes",

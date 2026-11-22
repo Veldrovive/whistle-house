@@ -83,7 +83,7 @@ src/whistle_house/
     hum_labels.py    pYIN hum pitch labels (offline, librosa), harmonic-level profile
   external/          external datasets: base.py (download/prepare/manifest framework),
                      datasets.py (mlend_whistles, mlend_hums, musan, esc50, demand)
-  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep),
+  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep/harmonic_long),
                      train.py (training loop, per-class metrics, status json, resume state),
                      tracking.py (optional Weights & Biases logging),
                      export.py (ONNX export of a checkpoint + OnnxStream, the torch-free
@@ -348,7 +348,16 @@ with different flags than it had (look at the pane for the last command line).
   the Pi: about the cost per chunk that `small` had before streaming was made incremental).
   `harmonic_deep` is `harmonic` with its block stack twice over (10 blocks, ~63k params,
   1.45 s time receptive field, same lookahead), about twice the cost per frame; not yet timed
-  on the Pi. `large` (about 190k params, frequency dilation, 16 frames of
+  on the Pi. `harmonic_long` (12 blocks, dilations up to 32 twice, ~76k params) reaches
+  further in time both ways: 2.94 s receptive field, of which 32 frames (0.37 s) are
+  lookahead. Untrained so far. Its events arrive 0.37 s late, so a pipeline using it needs
+  `score_align`'s `settle_s` at 0.5 (default 0.25 covers only the older archs). Training
+  examples start from silence, so a model only learns its whole context from frames further
+  in than its receptive field: `ml/train.py` makes the windows at least 1.5x the receptive
+  field (4.5 s for `harmonic_long`, 3 s as before for every other arch; `window_s` in the
+  status file). Its val numbers are therefore on 4.5 s windows and not strictly comparable
+  with the 3 s ones of the other archs: compare on the recordings (`inspect-model`). Expect
+  about 1.8x the memory per batch of `harmonic_deep`. `large` (about 190k params, frequency dilation, 16 frames of
   lookahead) is a reference model that shows how well detection can be done with this data;
   it is not meant to be cheap on the Pi. A lookahead model is delayed, not non-causal: the
   `learned` detector reports its events and scores `lookahead` frames late and pads the future
@@ -357,6 +366,10 @@ with different flags than it had (look at the pane for the last command line).
   architecture.
 
 ## Training-machine workflow (warm start)
+
+`--external all` / `warmstart` stop with an error when no prepared dataset is found under
+`WHISTLE_HOUSE_EXTERNAL` (an unplugged dataset disk used to turn "all" into "none" and start a
+synthetic-only pretrain).
 
 **Resuming.** After every validation `ml/train.py` writes the whole training state (model,
 optimiser, LR schedule, epoch, best F1, patience count, history) atomically to
@@ -427,6 +440,8 @@ with no tunes) per 4096-sample chunk = 93 ms of audio, synthetic test audio, med
   a stream cut into uneven chunks, and `tests/test_onnx.py` checks events and scores of both
   backends against each other. Default stays `torch`. **Re-export after retraining**: the
   Models page marks an export older than its checkpoint, and the detector logs a warning.
+* `harmonic_long` (untrained weights, model alone, onnx, 8 frames): 12.4 ms against 9.5 ms
+  for `harmonic_deep` and 4.8 ms for `harmonic`, so about 15% of a core for the pipeline.
 * `chunk_size` 1024 instead of 4096 costs about 2.5x the CPU (per-call overhead).
 * Not measured yet: `spectral_gate` in the chain, `score_align` with real tunes, the server
   process as a whole (websocket, encoding for the Live page).
@@ -458,7 +473,8 @@ stack (~14 dB harmonics over gaps on the frames that fire, vs ~30 dB on hums).
   for `humnet`, 5.1% for `humnet-deep`; on train-split speech 1.2% vs 0.3%. Train-split speech
   is also a training interferer (the 23 mic negatives are ~30% of interferer draws, most of
   them the owner's speech), so only held-out speech counts. Next: record several minutes of
-  held-out speech to measure this properly; time `harmonic_deep` on the Pi. Open questions: does singing count as a hum
+  held-out speech to measure this properly; train `harmonic_long` (same warm start,
+  `--arch harmonic_long`) and compare its speech-as-hum rate with these two. Open questions: does singing count as a hum
   (today it is neither class; MUSAN music is an interferer); sustained instrument notes are
   harmonic combs too; re-record hums on the Pi's USB mic.
 

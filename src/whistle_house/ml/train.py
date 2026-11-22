@@ -69,7 +69,7 @@ from whistle_house.ml.model import (
     save_checkpoint,
 )
 from whistle_house.ml.tracking import Tracker
-from whistle_house.pipeline import PipelineSpec
+from whistle_house.pipeline import Frontend, PipelineSpec
 from whistle_house.settings import Paths, external_root
 
 log = logging.getLogger(__name__)
@@ -99,6 +99,22 @@ class TrainConfig:
     wandb_project: str | None = None  # log to this Weights & Biases project (ml/tracking.py)
     wandb_group: str | None = None  # wandb group (warmstart: pretrain + fine-tune together)
     log_every: int = 10  # wandb: log the training loss every this many steps
+
+
+def _window_seconds(
+    net: WhistleNetConfig, spec: PipelineSpec, data_dir: Path, default: float
+) -> float:
+    """Length of the training examples for a model: the mix's own (3 s) unless the model's
+    receptive field needs more.
+
+    A window starts from silence, like a stream, so only frames further in than the receptive
+    field are trained with their whole context. Windows are at least 1.5x the receptive field
+    (to the next half second). Every arch up to ``harmonic_deep`` (1.45 s) keeps 3 s."""
+    fe = Frontend(spec.sample_rate, spec.transform, spec.filters, data_dir)
+    times = fe.transform.push(np.zeros(spec.sample_rate, np.float32)).times
+    period = float(np.median(np.diff(times)))
+    need = 1.5 * net.receptive_field * period
+    return max(default, float(np.ceil(need * 2) / 2))
 
 
 class _ExampleStream(torch.utils.data.IterableDataset):
@@ -280,7 +296,15 @@ def train(
                 raise ValueError(f"unknown arch {cfg.arch!r}; choose from {sorted(ARCHS)}")
             classes = tuple(cfg.classes) or tuple(ARCHS[cfg.arch].get("classes", ("whistle",)))
         status["classes"] = list(classes)
+        net_cfg = (
+            init[1].cfg
+            if init is not None
+            else WhistleNetConfig(**{"channels": cfg.channels, **ARCHS[cfg.arch]})
+        )
         gcfg = config_for_mix(cfg.mix, classes)
+        window_s = _window_seconds(net_cfg, spec, paths.root, gcfg.window_s)
+        gcfg = replace(gcfg, window_s=window_s)
+        status["window_s"] = window_s
         common = {
             "store": RecordingStore(paths.recordings),
             "label_cache_dir": paths.label_cache,

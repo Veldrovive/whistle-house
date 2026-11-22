@@ -93,6 +93,17 @@ def _fake_esc50(root):
             f.write(f"{fn},{fold},0,dog,False,x,A\n")
 
 
+def test_external_all_refuses_when_nothing_is_prepared(tmp_path, monkeypatch):
+    """A dataset disk that is not mounted must stop a run, not turn 'all' into 'none'."""
+    from whistle_house.cli import _external_list
+
+    monkeypatch.setattr("whistle_house.settings._env_loaded", True)
+    monkeypatch.setenv("WHISTLE_HOUSE_EXTERNAL", str(tmp_path / "unplugged"))
+    with pytest.raises(SystemExit, match="is the disk mounted"):
+        _external_list("all")
+    assert _external_list("") == [] and _external_list("musan, esc50") == ["musan", "esc50"]
+
+
 def test_prepare_and_manifest(tmp_path):
     _fake_mlend(tmp_path)
     _fake_esc50(tmp_path)

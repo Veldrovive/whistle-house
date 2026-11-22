@@ -48,6 +48,8 @@ anywhere else (broadband speech energy, a stronger comb elsewhere).
 ``large`` is a whistle-only reference model for "how well can this be done". ``harmonic`` is the
 whistle + hum model described above; it needs a log-frequency front end (``stft_log``).
 ``harmonic_deep`` is the same with twice the blocks (twice the time receptive field).
+``harmonic_long`` reaches further in time in both directions: dilations up to 32 (2.9 s
+receptive field) and 32 frames of lookahead.
 """
 
 from __future__ import annotations
@@ -85,6 +87,11 @@ class WhistleNetConfig:
     bins_per_octave: float = 0.0
     freq_context: bool = False  # per-block pooling over the whole frequency axis
 
+    @property
+    def receptive_field(self) -> int:
+        """Input frames one output depends on (``lookahead`` of them are after its frame)."""
+        return 1 + sum((self.kernel_t - 1) * d for d in self.dilations)
+
 
 ARCHS: dict[str, dict] = {
     "small": {},  # ~7k params, causal: the whistle-only Pi model
@@ -113,6 +120,22 @@ ARCHS: dict[str, dict] = {
         "channels": 24,
         "dilations": (1, 2, 4, 8, 16, 1, 2, 4, 8, 16),
         "lookahead": 12,
+        "classes": ("whistle", "hum"),
+        "harmonics": HARMONIC_GRID,
+        "freq_context": True,
+    },
+    # Longer context in both directions, for the same problem. Two dilation cycles up to 32:
+    # 12 blocks, ~75k params, time receptive field 253 frames (2.94 s), about 1.3x the cost per
+    # frame of ``harmonic_deep`` (dilation is free; the streaming state grows to ~250 frames).
+    # 32 frames (0.37 s) of that are lookahead, so 2.6 s are past: a decision about a frame
+    # sees whether the sound went on as a held note or broke up into syllables. Events arrive
+    # 0.37 s late; a tune only fires after ``quiet_after_s`` of silence anyway, but the
+    # recognizer's ``settle_s`` must cover the delay (0.5 instead of the default 0.25).
+    # Training uses longer windows for it (``ml/train.py``: 1.5x the receptive field).
+    "harmonic_long": {
+        "channels": 24,
+        "dilations": (1, 2, 4, 8, 16, 32, 1, 2, 4, 8, 16, 32),
+        "lookahead": 32,
         "classes": ("whistle", "hum"),
         "harmonics": HARMONIC_GRID,
         "freq_context": True,
@@ -215,7 +238,7 @@ class WhistleNet(nn.Module):
 
     @property
     def receptive_field(self) -> int:
-        return 1 + sum((self.cfg.kernel_t - 1) * d for d in self.cfg.dilations)
+        return self.cfg.receptive_field
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B, T, F) -> presence (B, T, K), salience (B, T, K, F), aligned with the input."""

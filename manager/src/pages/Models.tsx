@@ -222,13 +222,14 @@ export function Models() {
               ))}
             </select>
           </label>
-          <label title="small: the ~7k-parameter causal whistle model for the Pi. large: a ~190k-parameter whistle reference model with lookahead, to see how well detection can be done. harmonic: whistles + hums (~31k parameters); needs a pipeline with a log-frequency transform (stft_log) and no noise_floor filter, which swallows held hums. harmonic_deep: the same with twice the blocks (~60k parameters, 1.45 s of context instead of 0.73 s), about twice the cost. Ignored when fine-tuning (the checkpoint's architecture is kept).">
+          <label title="small: the ~7k-parameter causal whistle model for the Pi. large: a ~190k-parameter whistle reference model with lookahead, to see how well detection can be done. harmonic: whistles + hums (~31k parameters); needs a pipeline with a log-frequency transform (stft_log) and no noise_floor filter, which swallows held hums. harmonic_deep: the same with twice the blocks (~60k parameters, 1.45 s of context instead of 0.73 s), about twice the cost. harmonic_long: 12 blocks (~75k parameters) with 2.9 s of context and 0.37 s of lookahead instead of 0.14 s, so its events arrive later (set the recognizer's settle_s to 0.5); trains on 4.5 s windows, so it needs more memory per batch. Ignored when fine-tuning (the checkpoint's architecture is kept).">
             model{' '}
             <select value={form.arch} onChange={(e) => setForm({ ...form, arch: e.target.value })} disabled={!!form.init_from}>
               <option>small</option>
               <option>large</option>
               <option>harmonic</option>
               <option>harmonic_deep</option>
+              <option>harmonic_long</option>
             </select>
           </label>
           <label title="Also log metrics to this Weights & Biases project (needs `uv sync --extra wandb` and `wandb login` on the machine running the server). Empty = off.">

@@ -143,6 +143,42 @@ def test_deep_harmonic_model_streams_with_twice_the_context():
     assert torch.allclose(torch.cat([s for _, s in parts], 1), sal, atol=1e-5)
 
 
+def test_long_harmonic_model_streams_and_trains_on_longer_windows(tmp_path):
+    from whistle_house.ml.model import ARCHS, WhistleNet, WhistleNetConfig, log_bins_per_octave
+    from whistle_house.ml.train import _window_seconds
+    from whistle_house.pipeline import PipelineSpec, StageSpec
+    from whistle_house.stages.transforms.stft import log_frequencies
+
+    freqs = log_frequencies(60, 4000, 24)
+    bpo = log_bins_per_octave(freqs)
+    cfg = WhistleNetConfig(n_bins=len(freqs), bins_per_octave=bpo, **ARCHS["harmonic_long"])
+    long = WhistleNet(cfg)
+    assert len(long.blocks) == 12 and long.receptive_field == 253 and cfg.lookahead == 32
+    assert 70_000 < sum(p.numel() for p in long.parameters()) < 80_000
+    torch.manual_seed(2)
+    long.eval()
+    for blk in long.blocks:
+        torch.nn.init.normal_(blk.ctx.weight, std=0.2)
+    # untrained, 12 blocks deep: outputs reach ~50, so float round-off is ~4e-5
+    x = torch.randn(1, 300, len(freqs))  # longer than the receptive field
+    with torch.no_grad():
+        pres, sal = long.forward_causal(x)
+        state, parts = long.init_state(), []
+        for i in range(0, 300, 13):
+            p, s, state = long.forward_stream(x[:, i : i + 13], state)
+            parts.append((p, s))
+        aligned, _ = long(x)  # the delay hidden: output t is about input t
+    assert torch.allclose(torch.cat([p for p, _ in parts], 1), pres, atol=2e-4)
+    assert torch.allclose(torch.cat([s for _, s in parts], 1), sal, atol=2e-4)
+    assert torch.allclose(aligned[:, : 300 - 32], pres[:, 32:], atol=2e-4)
+
+    # training examples must be longer than the context; the older archs keep their 3 s
+    spec = PipelineSpec(transform=StageSpec(name="stft_log"))
+    assert _window_seconds(cfg, spec, tmp_path, 3.0) == 4.5
+    for name in ("small", "large", "harmonic", "harmonic_deep"):
+        assert _window_seconds(WhistleNetConfig(**ARCHS[name]), spec, tmp_path, 3.0) == 3.0
+
+
 def test_synth_hum_is_a_labelled_harmonic_stack():
     from whistle_house.data.hum_labels import harmonic_levels, hum_f0
 
