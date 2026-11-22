@@ -25,10 +25,11 @@ CUDA_VISIBLE_DEVICES=<gpu> scripts/train-forever.sh uv run whistle-house train-d
 
 ## Trade-offs vs. the earlier runs
 
-- **Shared GPU.** No GPU was free (another user's 8-GPU job, 100% util, 52-70 GB of 80 GB per
-  card). With the owner's OK this run shares a busy GPU. Effects: wall-clock time is longer
-  than an idle H100 would give and not comparable as a speed number; there is some OOM risk
-  for either job if the other one's memory peaks. Nothing that changes what is learned.
+- **GPU.** The first attempt shared GPU 5 with another user's job (stopped after epoch 1, see
+  the log). The run that counts had GPU 5 to itself.
+- **Thread limit + 24 workers** (`OMP/OPENBLAS/MKL_NUM_THREADS=1`, `--workers 24` instead of 8).
+  Changes nothing about what is learned (`workers` is resume-free in `ml/train.py`); see the
+  log for why.
 - **Batch size unchanged (32)**, same steps, epochs, val examples and LR as the earlier runs.
 - **Windows are 4.5 s** for this arch (3 s for the others; see AGENTS.md), so val numbers are
   not strictly comparable with `humnet-pretrain` / `humnet-deep-pretrain`. Compare on the
@@ -48,3 +49,20 @@ CUDA_VISIBLE_DEVICES=<gpu> scripts/train-forever.sh uv run whistle-house train-d
 - GPU memory: this run 12.2 GB; GPU 5 total 73.4 / 80 GB with the other user's job (61 GB).
   ~6.6 GB headroom: if their job grows (it reaches ~70 GB on other cards), one of the two can
   OOM. `train-forever.sh` resumes this run from the last validation if it dies.
+- Epoch 1 (shared GPU): 444 s, f1 0.760 (whistle 0.815, hum 0.704). wandb `cnwtyubo`.
+- 11:58 owner freed GPU 5; first attempt stopped and **restarted from scratch** (wandb
+  `sp13n99j`). Diagnosis before the restart: GPU 5 at ~0% util for our process; the 8 data
+  workers each ran ~12 threads (numpy/BLAS pools sized to the 112-core machine), together ~97
+  cores, machine load 194. The bottleneck was example generation thrashing, not the GPU.
+  Fix: BLAS pools at 1 thread per process, 24 workers.
+- After the fix: epoch 1 in **78 s** (5.7x faster), GPU util 45-96% (mean ~65%), our CPU ~14
+  cores (from ~97), machine load 194 -> 20. GPU memory 12.2 GB.
+  Workers are now ~58% busy, i.e. waiting on the training loop: the main process (~90% of a
+  core: targets in numpy, host->device copy, kernel launches) plus the GPU on a small model at
+  batch 32 is the limit. Further speed would need a larger batch, AMP, `torch.compile` or
+  targets on the GPU; all change the recipe vs `humnet-pretrain` / `humnet-deep-pretrain`, and
+  at ~78 min for 60 epochs not worth it here. Batch size stays 32.
+- Epoch 1 (restart): f1 0.780 (whistle 0.800, hum 0.760), FPR 4.5%.
+- **Lesson for any training machine with many cores:** run training with
+  `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1`. Worth making the default in
+  the DataLoader worker init (the Mac has few cores, so it likely never showed there).
