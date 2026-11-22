@@ -63,6 +63,21 @@ CUDA_VISIBLE_DEVICES=<gpu> scripts/train-forever.sh uv run whistle-house train-d
   targets on the GPU; all change the recipe vs `humnet-pretrain` / `humnet-deep-pretrain`, and
   at ~78 min for 60 epochs not worth it here. Batch size stays 32.
 - Epoch 1 (restart): f1 0.780 (whistle 0.800, hum 0.760), FPR 4.5%.
-- **Lesson for any training machine with many cores:** run training with
-  `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1`. Worth making the default in
-  the DataLoader worker init (the Mac has few cores, so it likely never showed there).
+- **Lesson for any training machine with many cores:** BLAS pools in the data workers must be
+  one thread each. Now the default in code: `threads.limit_worker_threads` runs in every
+  DataLoader worker and labelling worker (checked: pools 64 -> 1 threads per worker). The env
+  vars are no longer needed. (The Mac has few cores, so it likely never showed there.)
+- **Batch size, measured** (model step alone on GPU 5, synthetic 4.5 s windows = 140 frames x
+  146 bins, while the run was training on the same GPU):
+
+  | batch | step    | per example | numpy targets | peak mem |
+  |-------|---------|-------------|---------------|----------|
+  | 32    | 132 ms  | 4.14 ms     | 12 ms         | 4.2 GB   |
+  | 64    | 235 ms  | 3.67 ms     | 18 ms         | 8.5 GB   |
+  | 128   | 477 ms  | 3.73 ms     | 41 ms         | 16.9 GB  |
+  | 256   | 978 ms  | 3.82 ms     | 91 ms         | 33.8 GB  |
+
+  Step time is linear in batch: the GPU is already compute-bound at 32 (the model is small in
+  parameters, 76k, but its activations cover every time-frequency cell through 12 blocks). A
+  larger batch would gain ~10% examples/s at most and change the recipe, so it stays 32. If
+  speed ever matters, the levers are bf16 autocast / `channels_last`, not batch size.

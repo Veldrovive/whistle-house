@@ -52,7 +52,8 @@ mise.toml            node version for the manager (managed by mise)
 src/whistle_house/
   types.py           FrequencyAxis, FrameBlock, WhistleEvent, DetectorOutput, TuneMatch
   pipeline.py        PipelineSpec / Frontend / Pipeline / PipelineStore
-  threads.py         one thread per numeric library in `serve` (see "Inference on the Pi")
+  threads.py         one thread per numeric library in `serve` (see "Inference on the Pi") and in
+                     every training data / labelling worker (many-core training machines)
   settings.py        .env loading; data dir (WHISTLE_HOUSE_DATA) + external root (WHISTLE_HOUSE_EXTERNAL)
   tunes.py           Tune model (Score = sheet music, or a template fitted from examples),
                      TuneLibrary (data/tunes.json), note-template fitting

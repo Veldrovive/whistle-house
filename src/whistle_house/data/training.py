@@ -62,6 +62,7 @@ from whistle_house.data.augment import (
 from whistle_house.data.store import NEGATIVE_LABELS, RecordingStore
 from whistle_house.pipeline import Frontend
 from whistle_house.stages.base import StageContext, build_stage
+from whistle_house.threads import limit_worker_threads
 from whistle_house.types import WhistleEvent
 
 log = logging.getLogger(__name__)
@@ -335,7 +336,9 @@ class LabelCache:
                 job, job_args = _label_job, (frontend_spec, labeler_params, data_dir)
             jobs = [(k, p, s, *job_args) for k, p, s in todo]
             if workers > 1:
-                with ProcessPoolExecutor(workers, mp_context=_mp_context()) as pool:
+                with ProcessPoolExecutor(
+                    workers, mp_context=_mp_context(), initializer=limit_worker_threads
+                ) as pool:
                     for n, (k, f0) in enumerate(pool.map(job, jobs, chunksize=4)):
                         self.labels[k] = f0
                         if (n + 1) % 200 == 0:

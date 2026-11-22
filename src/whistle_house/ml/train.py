@@ -71,6 +71,7 @@ from whistle_house.ml.model import (
 from whistle_house.ml.tracking import Tracker
 from whistle_house.pipeline import Frontend, PipelineSpec
 from whistle_house.settings import Paths, external_root
+from whistle_house.threads import limit_worker_threads
 
 log = logging.getLogger(__name__)
 
@@ -403,6 +404,7 @@ def train(
             prefetch_factor=4 if cfg.workers else None,
             persistent_workers=cfg.workers > 0,
             multiprocessing_context=_mp_context() if cfg.workers else None,
+            worker_init_fn=limit_worker_threads if cfg.workers else None,
         )
         batches = iter(loader)
 
