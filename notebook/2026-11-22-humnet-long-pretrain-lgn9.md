@@ -81,3 +81,31 @@ CUDA_VISIBLE_DEVICES=<gpu> scripts/train-forever.sh uv run whistle-house train-d
   parameters, 76k, but its activations cover every time-frequency cell through 12 blocks). A
   larger batch would gain ~10% examples/s at most and change the recipe, so it stays 32. If
   speed ever matters, the levers are bf16 autocast / `channels_last`, not batch size.
+
+## Result: `humnet-long-pretrain` (batch 32) — done 13:20
+
+60 epochs in 79.6 min of epoch time, one attempt, no crashes. Best checkpoint epoch 57 (val,
+4.5 s windows):
+
+| metric                | mean  | whistle | hum   |
+|-----------------------|-------|---------|-------|
+| F1                    | 0.921 | 0.916   | 0.926 |
+| precision             | 0.928 | 0.918   | 0.937 |
+| recall                | 0.914 | 0.914   | 0.915 |
+| false positive rate   | 0.022 | 0.022   | 0.022 |
+| pitch acc (1st)       | 0.958 | 0.984   | 0.932 |
+| overtone rate         | 0.008 | 0.000   | 0.016 |
+
+Files on lgn9: `~/projects/whistle-house/data/models/humnet-long-pretrain.pt` (345 KB,
+sha256 `4285d439…0c15`) and `.json`. Next (on the Mac): fine-tune with `--init-from
+humnet-long-pretrain` (command in the handoff / AGENTS.md), then `inspect-model` to compare
+speech-as-hum with `humnet` / `humnet-deep` on held-out speech.
+
+## Side experiment: `humnet-long-pretrain-b128` (running)
+
+Question from the owner: does a larger batch give a better final model? Same command with
+`--batch-size 128 --workers 32`, same 60 x 500 steps and LR 2e-3, so 4x the examples per
+update and per epoch; only the batch differs. GPU 7 (free per gpu-tracker), started 12:24,
+333 s/epoch -> ETA ~17:55. wandb `1m4m6038`. Uses the in-code worker thread limit (no env
+vars): each worker <= 1 core (the ~127 OpenBLAS threads per worker exist but idle).
+Epoch 1: f1 0.798 vs 0.780 for batch 32.
