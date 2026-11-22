@@ -110,7 +110,7 @@ update and per epoch; only the batch differs. GPU 7 (free per gpu-tracker), star
 vars): each worker <= 1 core (the ~127 OpenBLAS threads per worker exist but idle).
 Epoch 1: f1 0.798 vs 0.780 for batch 32.
 
-## Longer run: `humnet-long-pretrain-e240` (running)
+## Longer run: `humnet-long-pretrain-e240` — done 18:42
 
 The batch-32 run was still improving at the end (val F1 0.912 @ 40, 0.919 @ 50, 0.921 @ 60,
 train loss still falling; part of that is OneCycle's LR annealing). Fresh run, 240 epochs
@@ -126,3 +126,32 @@ runs also answer the batch question:
 | humnet-long-pretrain-e240 | 32    | 240    | 3.84 M   | 120 k   |
 
 GPU 5 (free per gpu-tracker), started 13:27, 82 s/epoch -> ETA ~18:55. wandb `y4qe2uoa`.
+
+### Result (e240)
+
+Done 18:42 (315 min of epoch time, one attempt). Best epoch 181:
+
+| run (best epoch)               | F1    | whistle F1 | hum F1 | FPR   | pitch acc | hum pitch acc |
+|--------------------------------|-------|------------|--------|-------|-----------|---------------|
+| humnet-long-pretrain (57/60)   | 0.921 | 0.916      | 0.926  | 0.022 | 0.958     | 0.932         |
+| humnet-long-pretrain-e240 (181/240) | 0.928 | 0.923 | 0.933  | 0.021 | 0.964     | 0.940         |
+| humnet-long-pretrain-b128 (31/60, unfinished) | 0.924 | 0.921 | 0.927 | 0.023 | 0.961 | 0.936 |
+
+e240 val F1 along the way: 0.894 @ 30, 0.907 @ 60, 0.918 @ 90, 0.919 @ 120, 0.921 @ 150,
+0.925 @ 180, 0.927 @ 210, 0.927 @ 240 (mean of the last 5 epochs 0.927). So 4x the training
+buys +0.007 F1 on val, flat over the last ~40 epochs: it is near what this arch + data give
+with this recipe. Files: `data/models/humnet-long-pretrain-e240.pt` (sha256 `7b5c96e4…b0c8`)
++ `.json`. wandb `y4qe2uoa`.
+
+### b128 hang
+
+`humnet-long-pretrain-b128` stopped making progress at 15:17 (wandb's last log: global step
+15890, 390 steps into epoch 32) but did not exit: main process at 100% CPU in state R, GPU 7 at
+100%, all 32 workers alive and idle (queues full), SIGINT ignored. Looks like a hung CUDA op
+the main process spins on; no Xid or ECC errors visible (dmesg is not readable here; a stack
+dump with py-spy was not run). Nothing caught it for 3.5 h because `train-forever.sh` only
+retries on exit and my watcher only looked for an exit. 18:44: SIGTERM -> `train-forever.sh`
+resumed from the epoch-31 state; ETA ~21:25. The watcher now also flags a stall (no status
+update for 15 min).
+Possible improvement: a step-progress watchdog in `ml/train.py` (or `train-forever.sh`) that
+kills a run whose status/step counter has not moved for N minutes, so the retry covers hangs.
