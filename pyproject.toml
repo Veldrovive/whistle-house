@@ -21,7 +21,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # Learned whistle detector training + inference, and offline hum pitch labelling.
-ml = ["torch>=2.5", "librosa>=0.10"]  # librosa: pYIN hum pitch labels
+# onnx + onnxruntime: export a checkpoint for the Pi and check the export against torch.
+ml = ["torch>=2.5", "librosa>=0.10", "onnx>=1.17", "onnxruntime>=1.20"]  # librosa: pYIN hum labels
+# Inference only (the Pi): runs an exported checkpoint without torch.
+onnx = ["onnxruntime>=1.20"]
 wandb = [
     "wandb>=0.19",
 ]

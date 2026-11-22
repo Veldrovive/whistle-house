@@ -50,6 +50,7 @@ mise.toml            node version for the manager (managed by mise)
 src/whistle_house/
   types.py           FrequencyAxis, FrameBlock, WhistleEvent, DetectorOutput, TuneMatch
   pipeline.py        PipelineSpec / Frontend / Pipeline / PipelineStore
+  threads.py         one thread per numeric library in `serve` (see "Inference on the Pi")
   settings.py        .env loading; data dir (WHISTLE_HOUSE_DATA) + external root (WHISTLE_HOUSE_EXTERNAL)
   tunes.py           Tune model (Score = sheet music, or a template fitted from examples),
                      TuneLibrary (data/tunes.json), note-template fitting
@@ -85,6 +86,8 @@ src/whistle_house/
   ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep),
                      train.py (training loop, per-class metrics, status json, resume state),
                      tracking.py (optional Weights & Biases logging),
+                     export.py (ONNX export of a checkpoint + OnnxStream, the torch-free
+                     runtime behind the learned detector's `onnx` backend),
                      inspect.py + inspect_page.html (layer-by-layer report of a whistle + hum
                      checkpoint on the recordings, see "Model report" below)
   outputs/           output types (log, webhook, home_assistant_event) + OutputStore (data/outputs.json)
@@ -100,7 +103,8 @@ manager/             Vite + React + TS manager website
 tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data,
                      augmentation labels, server API, harmonic model (test_harmonic.py),
                      overtone rejection (test_overtones.py), written tunes against simulated
-                     performances (test_score_align.py), model report (test_inspect.py)
+                     performances (test_score_align.py), model report (test_inspect.py),
+                     ONNX export == torch + thread limit (test_onnx.py)
 .env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines,
                      reports/<model>/ = model reports)
@@ -110,7 +114,8 @@ data/                runtime data, gitignored (recordings, models, tunes, output
 
 ```bash
 uv sync                      # python deps (+ dev group)
-uv sync --extra ml           # + torch, for the learned detector / training
+uv sync --extra ml           # + torch, for the learned detector / training (+ onnx export)
+uv sync --extra onnx         # the Pi: onnxruntime only, runs exported checkpoints without torch
 uv run pytest -q             # tests (must pass before committing)
 uv run ruff format src tests && uv run ruff check src tests
 
@@ -132,6 +137,8 @@ uv run whistle-house noise-profile create room --add   # profile from all 'silen
 uv run whistle-house hum-labels                # pYIN pitch + harmonic profile of every 'hum' clip
 uv run whistle-house inspect-model humnet      # -> data/reports/humnet/index.html (~1 min,
                                                # ~1.7 GB peak; Models page: "Build report")
+uv run whistle-house export-onnx humnet        # -> data/models/humnet.onnx, checked against
+                                               # torch (or 'all'; Models page: "Export ONNX")
 
 # manager (node via mise: `mise install` once; prefix with `mise exec --` if mise isn't activated)
 cd manager && npm install
@@ -182,7 +189,8 @@ with different flags than it had (look at the pane for the last command line).
    whose default keeps the old behaviour. `tests/test_transform.py` pins `stft_mel` to v1.
 4. **Training runs on another machine** (clone the repo, copy `data/`). The Pi only runs
    inference and must never store external datasets (`datasets fetch` refuses on a Pi). Don't spend effort making training fast on the Pi. Inference cost on the Pi does
-   matter: a pipeline using the `learned` detector should use `chunk_size` ≈ 4096.
+   matter: a pipeline using the `learned` detector should use `chunk_size` ≈ 4096 and
+   `backend: onnx` (see "Inference on the Pi").
 5. **Data is precious.** `data/` is gitignored and holds hand-collected recordings. Never delete
    or rewrite recordings or `data/` contents without asking. Recording splits are deterministic
    from the id (`split_for`). Don't reshuffle them.
@@ -377,6 +385,7 @@ uv run whistle-house warmstart --skip-fetch --workers 8
 #   + train-detector --mix finetune --external all --init-from whistlenet-pretrain --name whistlenet
 #       --steps-per-epoch 50 --epochs 60 --patience 15   (short epochs = frequent validation)
 #     (fine-tune is skipped if data/ has no mic whistle recordings yet)
+uv run whistle-house export-onnx whistlenet     # whistlenet.onnx: what the Pi runs
 rsync -a data/models/whistlenet.* pi:projects/whistle-house/data/models/
 ```
 
@@ -386,10 +395,41 @@ For the whistle + hum model run the same recipe on a log-frequency pipeline:
 pYIN-labels the external hums).
 
 Then on the Pi make a pipeline with the `learned` detector (`checkpoint: whistlenet.pt`,
-`chunk_size` 4096, same transform/filters as the training pipeline). Its `kinds` param limits
+`backend: onnx`, `chunk_size` 4096, same transform/filters as the training pipeline). Its `kinds` param limits
 what a pipeline reports (e.g. `["whistle"]` to ignore hums). Re-run only the fine-tune
 step as more mic data is collected. To add a dataset: subclass `ExternalDataset` in
 `external/datasets.py` (`download`, `iter_sources`) and decorate with `@register_dataset`.
+
+## Inference on the Pi
+
+Measured on the Pi 5 (`dirk`), whole pipeline (front end + `learned` detector + `score_align`
+with no tunes) per 4096-sample chunk = 93 ms of audio, synthetic test audio, median ms:
+
+| checkpoint (arch)              | torch, no thread limit | torch | onnx | onnx, share of a core |
+|--------------------------------|------------------------|-------|------|-----------------------|
+| `whistlenet` (small)           | 42                     | 6.1   | 2.3  | 2.5%                  |
+| `humnet` (harmonic)            | 76 (worst 124)         | 10.9  | 6.6  | 7%                    |
+| `humnet-deep` (harmonic_deep)  | 103                    | 19.7  | 11.1 | 12%                   |
+| `whistlenet-large` (large)     | 108                    | 21.6  | 21.1 | 23%                   |
+
+* **Thread limit (`threads.py`).** numpy's OpenBLAS pool (the front end's filterbank multiply)
+  and PyTorch's pool fight over the four cores: one `harmonic` forward pass takes 9 ms alone
+  and 73 ms with a numpy multiply between calls. `serve` therefore runs each library with one
+  thread (`limit_inference_threads`, called before numpy is imported; the environment is put
+  back so training runs and reports started by the server keep all cores). More threads give
+  these models nothing. Anything else that runs a pipeline live must do the same.
+* **`backend: onnx`** on the `learned` detector runs `<name>.onnx` (made by `export-onnx` /
+  the Models page's "Export ONNX") in ONNX Runtime: about half the time of PyTorch for
+  `small` and `harmonic`, steadier worst case, and the Pi then needs neither torch nor the
+  `.pt` (`uv sync --extra onnx`). The graph is one streaming step (`forward_stream` + the
+  sigmoids, state in and out, any number of frames); arch, normalisation stats and front end
+  travel in the file's metadata. The export is refused unless it matches PyTorch to 1e-4 on
+  a stream cut into uneven chunks, and `tests/test_onnx.py` checks events and scores of both
+  backends against each other. Default stays `torch`. **Re-export after retraining**: the
+  Models page marks an export older than its checkpoint, and the detector logs a warning.
+* `chunk_size` 1024 instead of 4096 costs about 2.5x the CPU (per-call overhead).
+* Not measured yet: `spectral_gate` in the chain, `score_align` with real tunes, the server
+  process as a whole (websocket, encoding for the Live page).
 
 ## Model report (`inspect-model`)
 
@@ -430,5 +470,6 @@ stack (~14 dB harmonics over gaps on the frames that fire, vs ~30 dB on hums).
 * Evaluation page: run several pipelines over the test split and compare event precision/recall
   and false triggers per hour of speech.
 * Hard-negative mining: save live clips that triggered events but no tune, for relabelling.
-* Learned detector: quantise or export to ONNX for cheaper Pi inference.
+* Pi deployment: install with `--extra onnx`, copy the exported models, time `serve` as a
+  whole. Quantising is not needed at these costs.
 * Systemd unit for v2 once it replaces v1.

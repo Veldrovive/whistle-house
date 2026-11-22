@@ -17,6 +17,10 @@ def _paths(args):
 
 
 def cmd_serve(args) -> None:
+    from whistle_house.threads import limit_inference_threads
+
+    limit_inference_threads()  # before anything imports numpy
+
     import uvicorn
 
     from whistle_house.server.app import create_app
@@ -370,6 +374,24 @@ def cmd_inspect_model(args) -> None:
     )
 
 
+def cmd_export_onnx(args) -> None:
+    """Export checkpoints to ONNX for the `learned` detector's onnx backend."""
+    from whistle_house.ml.export import export_onnx
+
+    paths = _paths(args)
+    names = args.checkpoints
+    if names == ["all"]:
+        names = sorted(p.stem for p in paths.models.glob("*.pt"))
+    for name in names:
+        ck = Path(name)
+        if not ck.exists():
+            ck = paths.models / (ck.name if ck.suffix == ".pt" else f"{ck.name}.pt")
+        if not ck.exists():
+            raise SystemExit(f"checkpoint not found: {name}")
+        out = export_onnx(ck)
+        print(f"{ck.name} -> {out}  ({out.stat().st_size / 1024:.0f} kB, matches PyTorch)")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whistle-house")
     ap.add_argument("--data", help="data directory (default: $WHISTLE_HOUSE_DATA or ./data)")
@@ -531,6 +553,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", help="output directory (default: <data>/reports/<model>)")
     p.add_argument("--max-clip-s", type=float, default=20.0, help="seconds shown per clip")
     p.set_defaults(fn=cmd_inspect_model)
+
+    p = sub.add_parser(
+        "export-onnx",
+        help="export checkpoints to ONNX (<name>.onnx next to <name>.pt) for the learned "
+        "detector's onnx backend (ml extra)",
+    )
+    p.add_argument("checkpoints", nargs="+", help="model names or .pt paths, or 'all'")
+    p.set_defaults(fn=cmd_export_onnx)
 
     args = ap.parse_args(argv)
     logging.basicConfig(

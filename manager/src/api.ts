@@ -178,6 +178,14 @@ export type ModelStatus = {
   can_resume: boolean
   resumed?: { epoch: number; time: number }[] // one entry per resume: the epoch it continued after
   report: ModelReportStatus
+  onnx: ModelOnnxStatus
+}
+
+// ONNX export of a checkpoint (<name>.onnx), run by the learned detector's `onnx` backend
+export type ModelOnnxStatus = {
+  exists: boolean
+  exported: number | null // unix time of the export
+  stale: boolean // the checkpoint changed after the export
 }
 
 // Layer-by-layer report of a whistle + hum checkpoint (whistle-house inspect-model)
@@ -347,6 +355,8 @@ export const api = {
   modelLog: (name: string) => req<{ log: string }>('GET', `/api/models/${name}/log`),
   // (re)build a model's report; open it at modelReportUrl when status.report.exists
   buildModelReport: (name: string) => req('POST', `/api/models/${name}/report`),
+  // export a checkpoint to <name>.onnx (a few seconds; verified against PyTorch)
+  exportModelOnnx: (name: string) => req<ModelOnnxStatus>('POST', `/api/models/${name}/export-onnx`),
 }
 
 export const modelReportUrl = (name: string) => `/api/models/${encodeURIComponent(name)}/report/index.html`

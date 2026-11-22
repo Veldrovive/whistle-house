@@ -28,6 +28,38 @@ const CURVES = [
 
 type History = Record<string, number | null>[]
 
+/** ONNX export of a checkpoint (ml/export.py): the file the learned detector's `onnx` backend
+ * runs, about twice as fast on the Pi as PyTorch and usable there without torch. */
+function OnnxControls({ m, onChange }: { m: ModelStatus; onChange: () => void }) {
+  const act = useAction()
+  const o = m.onnx
+  const when = o?.exported ? new Date(o.exported * 1000).toLocaleString() : ''
+  return (
+    <>
+      {o?.exists && (
+        <span
+          className={o.stale ? 'error small' : 'muted small'}
+          title={
+            o.stale
+              ? `${m.name}.onnx (${when}) is older than the checkpoint: export it again`
+              : `${m.name}.onnx, exported ${when}. Use it with backend "onnx" on the learned detector`
+          }
+        >
+          {o.stale ? 'ONNX out of date' : 'ONNX ✓'}
+        </span>
+      )}
+      <button
+        disabled={act.busy}
+        title={`Write ${m.name}.onnx next to the checkpoint and check it against PyTorch. Copy it to the Pi and set the learned detector's backend to "onnx"`}
+        onClick={() => act.run(() => api.exportModelOnnx(m.name)).then(onChange)}
+      >
+        {act.busy ? 'Exporting…' : o?.exists ? 'Re-export ONNX' : 'Export ONNX'}
+      </button>
+      {act.error && <span className="error small">{act.error}</span>}
+    </>
+  )
+}
+
 /** Layer-by-layer report of a whistle + hum checkpoint on every recording (ml/inspect.py):
  * build it (about a minute for ~40 clips), then open it in a new tab. */
 function ReportControls({ m, onChange }: { m: ModelStatus; onChange: () => void }) {
@@ -332,6 +364,7 @@ export function Models() {
             >
               {logFor === m.name ? 'Hide log' : 'Log'}
             </button>
+            {m.has_checkpoint && !m.running && <OnnxControls m={m} onChange={models.reload} />}
             {m.has_checkpoint && m.classes?.includes('hum') && <ReportControls m={m} onChange={models.reload} />}
           </div>
           {m.report?.failed && (

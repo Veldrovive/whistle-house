@@ -555,8 +555,39 @@ def create_app(
             )
             st.pop("frontend", None)
             st["report"] = _report_status(st["name"])
+            st["onnx"] = _onnx_status(st["name"])
             out.append(st)
         return out
+
+    # ONNX exports (`whistle-house export-onnx`, ml/export.py): <name>.onnx next to <name>.pt,
+    # run by the learned detector's `onnx` backend.
+    def _onnx_status(name: str) -> dict:
+        pt, onnx = S.paths.models / f"{name}.pt", S.paths.models / f"{name}.onnx"
+        exists = onnx.exists()
+        return {
+            "exists": exists,
+            "exported": onnx.stat().st_mtime if exists else None,
+            # the checkpoint was written after the export (retrained, fine-tuned further)
+            "stale": exists and pt.exists() and pt.stat().st_mtime > onnx.stat().st_mtime,
+        }
+
+    @app.post("/api/models/{name}/export-onnx")
+    def export_model_onnx(name: str):
+        """Export a checkpoint to ONNX (a few seconds; checked against PyTorch)."""
+        pt = S.paths.models / f"{name}.pt"
+        if not pt.exists():
+            raise HTTPException(404, f"no checkpoint {name}.pt")
+        try:
+            from whistle_house.ml.export import export_onnx
+
+            export_onnx(pt)
+        except ImportError as e:
+            raise HTTPException(
+                400, f"exporting needs the ml extra here (`uv sync --extra ml`): {e}"
+            ) from e
+        except RuntimeError as e:
+            raise HTTPException(500, str(e)) from e
+        return _onnx_status(name)
 
     # Model reports (`whistle-house inspect-model`, ml/inspect.py): built in a subprocess into
     # <data>/reports/<model>/, served as static files under /api/models/<model>/report/.
