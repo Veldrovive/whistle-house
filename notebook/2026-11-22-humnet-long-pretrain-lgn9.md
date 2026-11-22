@@ -109,3 +109,20 @@ update and per epoch; only the batch differs. GPU 7 (free per gpu-tracker), star
 333 s/epoch -> ETA ~17:55. wandb `1m4m6038`. Uses the in-code worker thread limit (no env
 vars): each worker <= 1 core (the ~127 OpenBLAS threads per worker exist but idle).
 Epoch 1: f1 0.798 vs 0.780 for batch 32.
+
+## Longer run: `humnet-long-pretrain-e240` (running)
+
+The batch-32 run was still improving at the end (val F1 0.912 @ 40, 0.919 @ 50, 0.921 @ 60,
+train loss still falling; part of that is OneCycle's LR annealing). Fresh run, 240 epochs
+instead of 60 (the OneCycle schedule spans the whole run, so a finished run cannot be
+extended with `--resume`), everything else as `humnet-long-pretrain`. 240 x 500 x 32 = the
+same number of examples as the b128 run (60 x 500 x 128) with 4x the updates, so the three
+runs also answer the batch question:
+
+| run                       | batch | epochs | examples | updates |
+|---------------------------|-------|--------|----------|---------|
+| humnet-long-pretrain      | 32    | 60     | 0.96 M   | 30 k    |
+| humnet-long-pretrain-b128 | 128   | 60     | 3.84 M   | 30 k    |
+| humnet-long-pretrain-e240 | 32    | 240    | 3.84 M   | 120 k   |
+
+GPU 5 (free per gpu-tracker), started 13:27, 82 s/epoch -> ETA ~18:55. wandb `y4qe2uoa`.
