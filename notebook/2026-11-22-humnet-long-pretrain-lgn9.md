@@ -155,3 +155,10 @@ resumed from the epoch-31 state; ETA ~21:25. The watcher now also flags a stall 
 update for 15 min).
 Possible improvement: a step-progress watchdog in `ml/train.py` (or `train-forever.sh`) that
 kills a run whose status/step counter has not moved for N minutes, so the retry covers hangs.
+- **Second hang** at 19:55 (global step 21990, 490 steps into epoch 44), same symptoms: main
+  process R at 100% CPU, GPU 7 at 100%, 32 idle workers. Caught by the stall check at 20:06.
+  Both hangs were the b128 run on GPU 7; the two b32 runs on GPU 5 did 300 epochs without
+  one. To tell GPU 7 from batch 128 apart, the run was resumed (epoch 43 state) on **GPU 5**
+  at 20:08 (free per gpu-tracker). A hang there too would point at the b128 path, not the
+  card. The watcher now SIGTERMs a run that stalls 15 min so `train-forever.sh` resumes it
+  (stops after 3 stalls). 17 epochs left, ETA ~21:40.
