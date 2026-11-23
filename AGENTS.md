@@ -253,6 +253,19 @@ with different flags than it had (look at the pane for the last command line).
   silent share against the written rest. Key candidates come from votes of every
   (piece, note) pair, tempo candidates from the phrase length; both are refitted from the
   best alignment. Score = `exp(-mean cost per note)`.
+* **Leniency options** (both off by default, set on the recognizer in the Pipelines page).
+  A real hum of a 3-note tune that sounded right scored 0.67 (recording 56484487dcd3 on
+  dirk): the voice dipped 1.5 st under the last note for 0.25 s before settling, and notes
+  drifted by up to a semitone; 94% of the cost was pitch, timing almost nothing.
+  `off_pitch_cost` (default 2) is the most that time off a note's pitch can cost; 0.75
+  makes slides, scoops and overshoots cheap (that hum: 0.79). `median_weight` (0-1, default
+  0) judges a note by its central pitch (time-weighted median of its pieces) instead of by
+  every moment; at 1 scoops and drift inside a note cost nothing (that hum: 0.97, alone or
+  with the lower cap). At least half of every note must still be on pitch. The price, in
+  simulation at threshold 0.5: random 3-9 note melodies matching one of four 3-note tunes
+  went from 1 of 400 to 7 (either option alone) or 10 (both); against the five 4-8 note
+  test tunes from 5 to 9 of 400. The median matrix costs ~4 ms per alignment at 96 pieces
+  on a Mac; not timed on the Pi.
 * **A tune must stand alone** (default): quiet before the first note (`quiet_before_s`) and
   after the last (`quiet_after_s`, then `settle_s` for the detector's latency), because short
   tunes are often inside longer ones. So a match fires ~0.75 s after the last note. Set

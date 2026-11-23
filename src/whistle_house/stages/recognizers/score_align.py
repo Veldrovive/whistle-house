@@ -14,6 +14,10 @@ boundaries are ignored and the *score* decides where the notes are:
    in order (``align``). Time a note spends off its pitch (a scoop into it, the slide to the
    next one) costs a flat rate, so slides are allowed, but most of every note must be on its
    pitch. A repeated note that is not re-articulated (no gap) costs a little extra.
+   Two options make this more lenient (both off by default): ``off_pitch_cost`` lowers that
+   flat rate, and ``median_weight`` judges a note partly or wholly by its central pitch
+   (the time-weighted median of its pieces) instead of by every moment of it, so a scoop,
+   an overshoot after a leap or a drift at the end of a note hardly counts.
 4. **Key and tempo** are free: a few candidates of each are tried, then both are refitted
    from the best alignment. Timing is measured from note onset to note onset, relative to
    the tempo, so a note followed by a rest fills the same time as a longer note.
@@ -35,7 +39,7 @@ from whistle_house.stages.base import StageConfig, StageContext, TuneRecognizer,
 from whistle_house.tunes import Score, Tune
 from whistle_house.types import TuneMatch, WhistleEvent
 
-PITCH_COST_CAP = 2.0  # cost of time spent off a note's pitch (= 2 tolerances away or more)
+PITCH_COST_CAP = 2.0  # default cost of time spent off a note's pitch (2 tolerances away or more)
 ON_PITCH_TOLERANCES = 2.0  # within this many tolerances a step counts as "on" the note
 MIN_ON_PITCH_S = 0.04  # every note needs this much time on its pitch ...
 MIN_ON_PITCH_FRACTION = 0.5  # ... and this share of its sounded time
@@ -172,6 +176,8 @@ class AlignParams:
     slur_penalty: float = 0.3  # cost of a repeated note that was not re-articulated
     min_tempo_ratio: float = 0.5
     max_tempo_ratio: float = 2.0
+    off_pitch_cost: float = PITCH_COST_CAP  # most that time off a note's pitch costs
+    median_weight: float = 0.0  # share of a note's pitch cost taken from its median pitch
 
 
 @dataclass
@@ -207,15 +213,39 @@ class _Curve:
         self.forward = np.triu(np.ones((self.n + 1, self.n + 1), bool), 1)  # a < c
         self.log_span = np.log(self.span)
         self.silent = np.clip(1.0 - self.voiced / self.span, 0.0, 1.0)
+        self._medians: np.ndarray | None = None
+
+    def medians(self) -> np.ndarray:
+        """[a, c]: time-weighted median pitch of pieces a..c-1 (the lower one when two pieces
+        share the middle). Only meaningful for a < c. Computed on first use."""
+        if self._medians is None:
+            order = np.argsort(self.pitch, kind="stable")
+            edges = np.arange(self.n + 1)
+            inside = (order[None, None, :] >= edges[:, None, None]) & (
+                order[None, None, :] < edges[None, :, None]
+            )  # [a, c, rank]: is the piece of this pitch rank in a..c-1
+            upto = np.cumsum(inside * self.dur[order][None, None, :], axis=2)
+            half = 0.5 * upto[:, :, -1:] * (1.0 - 1e-12)
+            self._medians = self.pitch[order][np.argmax(upto >= half, axis=2)]
+        return self._medians
 
 
 def _pitch_terms(curve: _Curve, target: np.ndarray, p: AlignParams):
     """target (K,) performed pitch per key -> per-piece cost*duration and on-pitch duration,
     both (K, J)."""
     dev = np.abs(curve.pitch[None, :] - target[:, None])
-    cost = np.minimum(0.5 * np.square(dev / p.pitch_tolerance), PITCH_COST_CAP)
+    cost = np.minimum(0.5 * np.square(dev / p.pitch_tolerance), p.off_pitch_cost)
     on = dev <= ON_PITCH_TOLERANCES * p.pitch_tolerance
     return cost * curve.dur[None, :], on * curve.dur[None, :]
+
+
+def _blend_median(
+    mean_cost: np.ndarray | float, median: np.ndarray | float, target, p: AlignParams
+) -> np.ndarray | float:
+    """A note's pitch cost: its time-weighted mean cost, mixed (``median_weight``) with the
+    cost of its median pitch alone."""
+    center = np.minimum(0.5 * np.square((median - target) / p.pitch_tolerance), p.off_pitch_cost)
+    return (1.0 - p.median_weight) * mean_cost + p.median_weight * center
 
 
 def _length_cost(log_ratio: np.ndarray, final: bool, p: AlignParams) -> np.ndarray:
@@ -237,7 +267,10 @@ def _alignment_cost(
         voiced = float(curve.voiced[a, c])
         if on_dur[0, a:c].sum() < max(MIN_ON_PITCH_S, MIN_ON_PITCH_FRACTION * voiced) - 1e-9:
             return float("inf")
-        total += float(cost_dur[0, a:c].sum()) / voiced
+        mean_cost = float(cost_dur[0, a:c].sum()) / voiced
+        if p.median_weight > 0:
+            mean_cost = _blend_median(mean_cost, curve.medians()[a, c], prep.pitches[i] + key, p)
+        total += float(mean_cost)
         log_ratio = curve.log_span[a, c] - np.log(prep.beats[i] * spb)
         total += float(_length_cost(log_ratio, i == prep.n - 1, p))
         rest = (float(curve.silent[a, c]) - prep.rest_fractions[i]) / p.rest_tolerance
@@ -314,6 +347,9 @@ def align(
             on_to = np.concatenate([zeros, np.cumsum(on_dur, axis=1)], axis=1)
             on = on_to[:, None, :] - on_to[:, :, None]
             cost = (cost_to[:, None, :] - cost_to[:, :, None]) / curve.voiced[None]
+            if p.median_weight > 0:
+                target = (written + keys)[:, None, None]
+                cost = _blend_median(cost, curve.medians()[None], target, p)
             pitch_cost[written] = np.where(curve.forward[None] & (on >= need[None]), cost, np.inf)
         return pitch_cost[written]
 
@@ -469,6 +505,21 @@ class ScoreAlignRecognizer(TuneRecognizer):
             description="How loosely rests are judged: allowed error in the silent share of "
             "a note's time (1 std dev)",
         )
+        off_pitch_cost: float = Field(
+            PITCH_COST_CAP,
+            gt=0,
+            description="Most that time off a note's pitch can cost (a slide, a scoop, an "
+            "overshoot). 2 = strict; about 0.75 makes such moments cheap. At least half of "
+            "every note must be on pitch either way",
+        )
+        median_weight: float = Field(
+            0.0,
+            ge=0,
+            le=1,
+            description="How much a note is judged by its central (median) pitch instead of "
+            "by every moment of it. 0 = off; 1 = only the central pitch counts, so scoops "
+            "and drift within a note cost nothing",
+        )
         max_steps: int = Field(
             96,
             ge=8,
@@ -487,6 +538,8 @@ class ScoreAlignRecognizer(TuneRecognizer):
             slur_penalty=config.slur_penalty,
             min_tempo_ratio=config.min_tempo_ratio,
             max_tempo_ratio=config.max_tempo_ratio,
+            off_pitch_cost=config.off_pitch_cost,
+            median_weight=config.median_weight,
         )
         self._prepared: dict[str, tuple[str, PreparedScore | None]] = {}
         self.reset()

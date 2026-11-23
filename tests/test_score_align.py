@@ -49,6 +49,9 @@ CALL = score([(72, 1), (None, 1), (67, 0.5), (69, 0.5), (72, 2)])
 TUNES = {"arpeggio": ARPEGGIO, "twinkle": TWINKLE, "ode": ODE, "knock": KNOCK, "call": CALL}
 
 
+LENIENT = {"off_pitch_cost": 0.75, "median_weight": 1.0}
+
+
 def recognizer(tmp_path, tunes=None, **params) -> ScoreAlignRecognizer:
     lib = TuneLibrary(tmp_path / f"tunes-{len(list(tmp_path.iterdir()))}.json")
     for name, sc in (tunes or TUNES).items():
@@ -312,6 +315,82 @@ def test_threshold_tolerances_and_disabled_tunes(tmp_path):
     assert listen(rec, *perform(ARPEGGIO, Style(), rng)) == []
 
 
+# --------------------------------------------------------------------------- leniency
+
+# The pitch steps (start s, end s, MIDI pitch) the live pipeline found in a real hum of
+# "Falling" (recording 56484487dcd3, Fifine mic): one legato event that sounds right, but
+# the voice dips 1.5 semitones under the last note for a quarter of a second before
+# settling on it, and that note then drifts up a semitone.
+REAL_HUM = [
+    (1.42, 1.45, 49.63),
+    (1.45, 1.65, 49.66),
+    (1.65, 2.19, 50.26),
+    (2.19, 2.21, 49.04),
+    (2.21, 2.24, 47.93),
+    (2.24, 2.86, 47.20),
+    (2.86, 2.88, 45.35),
+    (2.88, 2.89, 44.30),
+    (2.89, 2.90, 43.36),
+    (2.90, 3.15, 41.73),
+    (3.15, 3.91, 42.94),
+    (3.91, 4.14, 43.99),
+]
+FALLING = score([(72, 1), (69, 1), (65, 1)], bpm=130)
+
+
+def real_hum():
+    times = np.arange(0, 5.1, FRAME_S)
+    curve = np.full(len(times), np.nan)
+    for start, end, pitch in REAL_HUM:
+        curve[(times >= start) & (times < end)] = pitch
+    return times, curve
+
+
+def test_lenient_options_forgive_a_scoop_and_drift(tmp_path):
+    def hum_score(**params):
+        rec = recognizer(tmp_path, tunes={"falling": FALLING}, threshold=0.05, **params)
+        (m,) = listen(rec, *real_hum(), kind="hum")
+        return m.score
+
+    strict = hum_score()
+    assert strict == hum_score(off_pitch_cost=2.0, median_weight=0.0)  # the defaults: both off
+    assert 0.6 < strict < 0.72
+    cheap = hum_score(off_pitch_cost=0.75)
+    central = hum_score(median_weight=1.0)
+    assert cheap > strict + 0.08
+    assert central > 0.9
+    assert strict < hum_score(median_weight=0.5) < central
+
+
+@pytest.mark.parametrize("variant", [[(72, 1), (65, 1), (69, 1)], [(65, 1), (69, 1), (72, 1)]])
+def test_lenient_options_still_reject_another_tune(tmp_path, variant):
+    rec = recognizer(tmp_path, tunes={"other": score(variant, bpm=130)}, **LENIENT)
+    assert listen(rec, *real_hum(), kind="hum") == []
+    rng = np.random.default_rng(0)
+    rec = recognizer(tmp_path, tunes={"arpeggio": ARPEGGIO}, **LENIENT)
+    flat_third = score([(60, 1), (62, 1), (67, 1), (72, 2)])  # one note a tone off
+    for style in (Style(), Style(legato=1.0, slide_s=0.1)):
+        assert listen(rec, *perform(flat_third, style, rng)) == []
+        assert names(listen(rec, *perform(ARPEGGIO, style, rng))) == ["arpeggio"]
+
+
+def test_median_matrix_is_the_weighted_median_of_each_span():
+    rng = np.random.default_rng(5)
+    edges = np.concatenate([[0.0], np.cumsum(rng.uniform(0.02, 0.3, 14))])
+    steps = [
+        Step(float(a), float(b), float(p))
+        for a, b, p in zip(edges[:-1], edges[1:], rng.uniform(50, 60, 14), strict=True)
+    ]
+    curve = _Curve(steps)
+    medians = curve.medians()
+    for a in range(curve.n):
+        for c in range(a + 1, curve.n + 1):
+            order = np.argsort(curve.pitch[a:c], kind="stable")
+            upto = np.cumsum(curve.dur[a:c][order])
+            want = curve.pitch[a:c][order][np.searchsorted(upto, 0.5 * upto[-1] * (1 - 1e-12))]
+            assert medians[a, c] == want
+
+
 # --------------------------------------------------------------------------- quiet
 
 
@@ -400,10 +479,14 @@ def test_streaming_in_any_chunk_size_gives_the_same_matches(tmp_path):
         assert summary(listen(rec, times, curve, chunk_frames=chunk)) == reference
 
 
-def test_alignment_cost_is_what_its_notes_cost(tmp_path):
+@pytest.mark.parametrize(
+    "params",
+    [AlignParams(), AlignParams(off_pitch_cost=0.75, median_weight=0.5)],
+    ids=["strict", "lenient"],
+)
+def test_alignment_cost_is_what_its_notes_cost(tmp_path, params):
     """The dynamic programme and the plain per-note cost agree on the alignment returned."""
     rng = np.random.default_rng(4)
-    params = AlignParams()
     for name, sc in TUNES.items():
         times, curve = perform(sc, sloppy(rng), rng)
         steps: list[Step] = []
