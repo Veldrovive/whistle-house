@@ -44,6 +44,7 @@ audio ─▶ Transform ─▶ [Filter, Filter, …] ─▶ WhistleDetector ─�
 ```
 AGENTS.md            this file (CLAUDE.md just imports it)
 scripts/train-forever.sh  rerun a training command with --resume until it finishes
+deploy/whistle-house.service  systemd unit that runs `serve` on the Pi (see "Running the server")
 notebook/            lab notebook: one dated markdown file per training run / experiment
                      (machine, command, trade-offs, results); committed
 pyproject.toml       python package (uv). extras: ml (torch), wandb (training machine only).
@@ -73,7 +74,8 @@ src/whistle_house/
     recognizers/score_align.py    tunes written as sheet music: aligns the score to the pitch
                                   curve, free in key and tempo (see "Tunes" below)
     recognizers/note_template.py  per-note template fitted from examples (one event per note)
-  audio/             io.py (load/save/resample), sources.py (MicSource, ReplaySource, ArraySource),
+  audio/             io.py (load/save/resample), sources.py (MicSource, ReplaySource, ArraySource;
+                     MicSource resamples when the device can't run at the pipeline rate),
                      render.py (filtered frames -> audio: the "Processed" playback in the manager)
   data/
     store.py         recordings: data/recordings/<id>.wav + <id>.json (label, tune, segments, split)
@@ -94,7 +96,8 @@ src/whistle_house/
                      inspect.py + inspect_page.html (layer-by-layer report of a whistle + hum
                      checkpoint on the recordings, see "Model report" below)
   outputs/           output types (log, webhook, home_assistant_event) + OutputStore (data/outputs.json)
-  server/            app.py (FastAPI /api + /ws/live, serves manager/dist), engine.py (LiveEngine)
+  server/            app.py (FastAPI /api + /ws/live, serves manager/dist), engine.py (LiveEngine;
+                     its watchdog reopens the mic after an error or 10 s without audio)
 manager/             Vite + React + TS manager website
   src/api.ts         typed client — mirror of server/app.py routes
   src/pages/         Live, Data, Tunes, Pipelines, Models, Outputs
@@ -107,7 +110,8 @@ tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, n
                      augmentation labels, server API, harmonic model (test_harmonic.py),
                      overtone rejection (test_overtones.py), written tunes against simulated
                      performances (test_score_align.py), model report (test_inspect.py),
-                     ONNX export == torch + thread limit (test_onnx.py)
+                     ONNX export == torch + thread limit (test_onnx.py),
+                     mic watchdog (test_engine_watchdog.py)
 .env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines,
                      reports/<model>/ = model reports)
@@ -150,13 +154,39 @@ npm run build    # -> manager/dist, served by `whistle-house serve`
 npm run lint
 ```
 
-### Running the server: always in tmux
+### Running the server
 
-`serve` runs in one agreed place, the **`server` window of the tmux session `whistle-house`**,
-started from the repo root, so any agent or human can find it, read its log and restart it.
-Don't start `serve` any other way (background job, another terminal, a second copy): one
-process owns :8000 and the mic. Check for it first; if it's there, reuse it. tmux comes from
-Homebrew on the Mac (`brew install tmux`), apt on the Pi.
+**On the Pi (dirk) `serve` is a systemd service**, `whistle-house.service`
+(`deploy/whistle-house.service`, installed in `/etc/systemd/system/`, enabled since
+2026-11-23). It runs the checkout's `.venv` directly as `aidan` from
+`~/projects/whistle-house`, so code changes there take effect on restart; it restarts
+on a crash and comes back after dirk's nightly 03:00 reboot. A missing or unplugged mic does
+not stop it: the engine's watchdog reopens it (backing off to one try a minute), and the
+manager's Live page shows the error meanwhile. Don't run `serve` in tmux on dirk too: one
+process owns :8000 and the mic. Checked on 2026-11-23: it starts at boot with the mic open,
+and when the mic vanished the engine went to `error` and kept retrying. Reopening after the
+mic came back was not seen on the hardware (the test rebooted dirk, see "Mic" below); the unit
+test covers it.
+
+```bash
+ssh dirk sudo systemctl restart whistle-house   # after pulling / editing backend code
+ssh dirk sudo systemctl stop whistle-house      # free the mic, e.g. to run `serve --replay` by hand
+ssh dirk journalctl -u whistle-house -f         # its log
+ssh dirk 'cd ~/projects/whistle-house/manager && ~/.local/bin/mise exec -- npm run build'
+#   after manager changes; no restart needed for that
+```
+
+The unit runs `.venv/bin/whistle-house`, not `uv run`, which would re-sync the venv without
+the `onnx` extra. After changing dependencies: `uv sync --extra onnx` on dirk, then restart.
+If you edit the unit file, copy it to `/etc/systemd/system/`, `systemctl daemon-reload` and
+restart.
+
+**Everywhere else (the Mac, the training machine) `serve` runs in tmux**, in one agreed
+place, the **`server` window of the tmux session `whistle-house`**, started from the repo
+root, so any agent or human can find it, read its log and restart it. Don't start `serve` any
+other way (background job, another terminal, a second copy): one process owns :8000 and the
+mic. Check for it first; if it's there, reuse it. tmux comes from Homebrew on the Mac (`brew
+install tmux`), apt on the Pi.
 
 ```bash
 tmux has-session -t whistle-house 2>/dev/null || tmux new-session -d -s whistle-house -n server -c "$PWD"
@@ -197,8 +227,9 @@ with different flags than it had (look at the pane for the last command line).
 5. **Data is precious.** `data/` is gitignored and holds hand-collected recordings. Never delete
    or rewrite recordings or `data/` contents without asking. Recording splits are deterministic
    from the id (`split_for`). Don't reshuffle them.
-6. **Mic contention on the Pi:** v1 runs as `whistle-hass.service` and holds the USB mic.
-   Stop it (with the owner's OK) before running `serve` live, or use `--replay`.
+6. **Mic contention on the Pi:** `whistle-house.service` (v2) holds the USB mic. Stop it
+   before running anything else live on dirk, or use `--replay`. v1's `whistle-hass.service`
+   is disabled (it fires the same Home Assistant events); keep it off while v2 runs.
 7. Use mise for toolchains (node). Don't hand-install runtimes.
 8. Keep code typed, small, and documented at module level. `ruff` must pass.
 9. **Hum pipelines:** the `harmonic` model needs a log-frequency front end (`stft_log`; training
@@ -446,6 +477,28 @@ with no tunes) per 4096-sample chunk = 93 ms of audio, synthetic test audio, med
 * `harmonic_long` (untrained weights, model alone, onnx, 8 frames): 12.4 ms against 9.5 ms
   for `harmonic_deep` and 4.8 ms for `harmonic`, so about 15% of a core for the pipeline.
 * `chunk_size` 1024 instead of 4096 costs about 2.5x the CPU (per-call overhead).
+* **Mic: Fifine K669B** (USB `0c76:161e`, ALSA name "USB PnP Audio Device", since
+  2026-11-22). It runs at 48 kHz only and PortAudio sees just the bare `hw:` device, so
+  `MicSource` opens it at 48 kHz and resamples to the pipeline's 44.1 kHz with a stateful
+  `soxr` stream (`StreamResampler`, chunk-invariant), letting PortAudio pick the block size
+  (an odd block like 1115 frames lost ~40% of the audio to overflows). Room noise on it:
+  about -69 dBFS RMS at mixer gain 215/496 (the old dongle hissed at ~-35 dBFS), with steady
+  tones at 97/118/310 Hz (not mains). Checkpoints and noise profiles from the old mic or
+  the Mac do not describe it: record a new `silence` clip + profile and new clips for the
+  fine-tune. On first plug-in the Pi's firmware mailbox timed out and the device stayed
+  unconfigured (`can't set config #1, error -62`, no ALSA card); re-authorising the port
+  fixed it: `echo 0 | sudo tee /sys/bus/usb/devices/3-1/authorized`, then `echo 1`. Only as
+  that last resort: on 2026-11-23 the same pair, used as an unplug test with the service
+  holding the mic, hung dirk within ~30 s of the `echo 1` and the hardware watchdog rebooted
+  it (Home Assistant and everything else with it). Test unplugs by hand.
+* **First Fifine clips** (2026-11-22, one each: 61 s silence, 22 s whistle, 23 s hum, 21 s
+  speech; noise profile `fifine` from the silence). Share of the speech clip reported as hum,
+  without / with a `spectral_gate`: `humnet` 11.0% / 11.3%, `humnet-deep` 7.6% / 8.0%,
+  `humnet-long-pretrain-e240` (no mic fine-tune) **1.4%** / 3.9%. None fired on silence,
+  confused kinds or reported speech as whistle; hum coverage 83-88% for all. The gate
+  cleans the spectrum but these models were trained ungated and gain nothing from it on
+  speech (it helps the long model on whistles, 85% vs 78%). Live pipeline on dirk:
+  `humnet-long-e240` (ungated). 21 s of speech is too little for a rate: record minutes.
 * Not measured yet: `spectral_gate` in the chain, `score_align` with real tunes, the server
   process as a whole (websocket, encoding for the Live page).
 
@@ -491,4 +544,5 @@ stack (~14 dB harmonics over gaps on the frames that fire, vs ~30 dB on hums).
 * Hard-negative mining: save live clips that triggered events but no tune, for relabelling.
 * Pi deployment: install with `--extra onnx`, copy the exported models, time `serve` as a
   whole. Quantising is not needed at these costs.
-* Systemd unit for v2 once it replaces v1.
+* v1 (`whistle-hass.service`, `~/projects/whistled-tune-detection`) can be removed from dirk
+  once v2 has run as a service for a while.

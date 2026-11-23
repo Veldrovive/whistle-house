@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.14",
     "soundfile>=0.12",
     "sounddevice>=0.5",
+    "soxr>=0.5",  # streaming resampler for mics that only run at 48 kHz
     "pydantic>=2.9",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",

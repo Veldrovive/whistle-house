@@ -21,6 +21,13 @@ def _pool_sizes() -> list[int]:
     return [p["num_threads"] for p in threadpool_info() if p["user_api"] == "blas"]
 
 
+@pytest.fixture(autouse=True)
+def _needs_visible_blas():
+    """macOS numpy uses Accelerate, which threadpoolctl cannot see (or size): nothing to check."""
+    if not _pool_sizes():
+        pytest.skip("no BLAS pool visible to threadpoolctl (e.g. Accelerate on macOS)")
+
+
 def test_worker_initializer_limits_blas(monkeypatch):
     for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         monkeypatch.delenv(k, raising=False)

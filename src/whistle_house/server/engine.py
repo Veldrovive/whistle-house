@@ -3,6 +3,12 @@
 The mic can only be opened once, so the engine also owns data collection: it keeps a rolling
 buffer of recent audio (``capture``: "save the last N seconds") and can record between
 ``start_recording``/``stop_recording``.
+
+Unattended runs (the systemd service on the Pi) need the mic to come back on its own, so a
+watchdog thread reopens it while the engine is meant to run (``start`` was called and ``stop``
+was not): after an error (mic missing at boot, PortAudio failure) and after a stall (no audio
+for ``STALL_S``, e.g. the USB mic was unplugged). Retries back off to ``RETRY_MAX_S``. Before
+a reopen PortAudio is reinitialised, since it only sees devices present when it started.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from collections.abc import Callable
 import numpy as np
 
 from whistle_house.audio.io import load_audio
-from whistle_house.audio.sources import MicSource, ReplaySource
+from whistle_house.audio.sources import MicSource, ReplaySource, refresh_devices
 from whistle_house.data.store import Recording, RecordingStore
 from whistle_house.outputs import OutputStore
 from whistle_house.pipeline import Pipeline, PipelineSpec
@@ -42,6 +48,10 @@ def encode_block(block: FrameBlock) -> dict:
 class LiveEngine:
     RING_SECONDS = 60
     PUBLISH_INTERVAL_S = 0.1
+    WATCHDOG_INTERVAL_S = 1.0  # how often the watchdog looks
+    STALL_S = 10.0  # no audio for this long while running = stalled mic
+    RETRY_MIN_S = 5.0  # first reopen delay; doubles per failed attempt
+    RETRY_MAX_S = 60.0
 
     def __init__(
         self,
@@ -74,6 +84,12 @@ class LiveEngine:
         self._subscribers: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = set()
         self._pending: list[dict] = []
         self.on_match: Callable[[TuneMatch], None] | None = None
+        self._control = threading.RLock()  # start/stop/reopen: API threads + watchdog
+        self._want_running = False  # start() called and stop() not since
+        self._last_audio = time.monotonic()
+        self._retry_s = self.RETRY_MIN_S
+        self._next_retry = 0.0
+        self._watchdog: threading.Thread | None = None
 
     # ------------------------------------------------------------------ control
 
@@ -103,6 +119,22 @@ class LiveEngine:
         }
 
     def start(self) -> None:
+        with self._control:
+            self._want_running = True
+            self._retry_s = self.RETRY_MIN_S
+            self._open()
+            if self._watchdog is None and not self.replay:
+                self._watchdog = threading.Thread(
+                    target=self._watch, name="live-watchdog", daemon=True
+                )
+                self._watchdog.start()
+
+    def stop(self) -> None:
+        with self._control:
+            self._want_running = False
+            self._close()
+
+    def _open(self) -> None:
         if self.state == "running" or self.spec is None:
             return
         try:
@@ -116,19 +148,51 @@ class LiveEngine:
             log.error(self.error)
             return
         self.state, self.error = "running", None
+        self._last_audio = time.monotonic()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="live-engine", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def _close(self) -> None:
         self._stop.set()
         if self._source:
-            self._source.close()
+            try:
+                self._source.close()
+            except Exception as e:  # noqa: BLE001 - a dead stream may fail to close
+                log.warning("closing audio source failed: %s", e)
         if self._thread:
             self._thread.join(timeout=2)
         self._source = self._thread = None
         if self.state == "running":
             self.state = "stopped"
+
+    def _watch(self) -> None:
+        """Reopen the mic after an error or a stall while the engine is meant to run."""
+        while True:
+            time.sleep(self.WATCHDOG_INTERVAL_S)
+            with self._control:
+                if not self._want_running:
+                    continue
+                now = time.monotonic()
+                stalled = self.state == "running" and now - self._last_audio > self.STALL_S
+                if stalled:
+                    log.warning("no audio for %.0f s; reopening the microphone", self.STALL_S)
+                    self.state, self.error = "error", f"no audio for {self.STALL_S:.0f} s"
+                    self._next_retry = 0.0  # first reopen after a stall: right away
+                if self.state != "error" or now < self._next_retry:
+                    continue
+                self._close()
+                try:
+                    refresh_devices()
+                except Exception as e:  # noqa: BLE001 - next attempt tries again
+                    log.warning("could not reinitialise PortAudio: %s", e)
+                log.info("reopening the microphone")
+                self._open()
+                if self.state == "running":
+                    self._retry_s = self.RETRY_MIN_S
+                else:
+                    self._next_retry = now + self._retry_s
+                    self._retry_s = min(self._retry_s * 2, self.RETRY_MAX_S)
 
     def status(self) -> dict:
         return {
@@ -215,6 +279,7 @@ class LiveEngine:
             for chunk in self._source:
                 if self._stop.is_set():
                     break
+                self._last_audio = time.monotonic()
                 with self._lock:
                     self._ring.append(chunk)
                     self._ring_len += len(chunk)

@@ -1,0 +1,29 @@
+# whistle-house as a systemd service on the Pi (dirk): live engine + manager on :8000.
+# Install (see AGENTS.md, "Running as a service on the Pi"):
+#   sudo cp deploy/whistle-house.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now whistle-house
+# Runs the checkout's venv directly (not `uv run`, which would re-sync it and drop the onnx extra).
+# A missing or unplugged mic does not stop the service: the live engine's watchdog reopens it.
+
+[Unit]
+Description=whistle-house whistle/hum detector + manager (:8000)
+Wants=network-online.target sound.target
+After=network-online.target sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=aidan
+Group=aidan
+SupplementaryGroups=audio
+WorkingDirectory=/home/aidan/projects/whistle-house
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/aidan/projects/whistle-house/.venv/bin/whistle-house serve
+Restart=always
+RestartSec=5
+# The server is real-time; let it win over batch work (geocache cron, VS Code server).
+Nice=-5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
