@@ -162,3 +162,28 @@ kills a run whose status/step counter has not moved for N minutes, so the retry 
   at 20:08 (free per gpu-tracker). A hang there too would point at the b128 path, not the
   card. The watcher now SIGTERMs a run that stalls 15 min so `train-forever.sh` resumes it
   (stops after 3 stalls). 17 epochs left, ETA ~21:40.
+- b128 finished 21:38 on GPU 5: 17 epochs after the move, no stall. Together with the two
+  hangs on GPU 7 and none in 300 epochs on GPU 5, GPU 7 is the likely culprit (noted in the
+  owner's global Claude instructions: avoid it, or run with a stall watchdog).
+
+## Final comparison (val, 4.5 s windows, best epoch by mean F1)
+
+| run                       | batch | epochs | examples | updates | best ep | F1    | whistle F1 | hum F1 | FPR   | pitch acc | hum pitch acc | overtone |
+|---------------------------|-------|--------|----------|---------|---------|-------|------------|--------|-------|-----------|---------------|----------|
+| humnet-long-pretrain      | 32    | 60     | 0.96 M   | 30 k    | 57      | 0.921 | 0.916      | 0.926  | 0.022 | 0.958     | 0.932         | 0.008    |
+| humnet-long-pretrain-b128 | 128   | 60     | 3.84 M   | 30 k    | 54      | 0.926 | 0.919      | 0.933  | 0.021 | 0.966     | 0.944         | 0.007    |
+| humnet-long-pretrain-e240 | 32    | 240    | 3.84 M   | 120 k   | 181     | 0.928 | 0.923      | 0.933  | 0.021 | 0.964     | 0.940         | 0.008    |
+
+(mean F1 of the last 5 epochs: 0.921 / 0.926 / 0.927; b128 sha256 `096e52bf…dbd3`, wandb `1m4m6038`)
+
+- **More data helps, batch size barely matters.** Both 3.84 M-example runs beat the 0.96 M one
+  by +0.005-0.007 F1, with better pitch accuracy. Between them, e240 (4x the updates) is
+  +0.002 F1, mostly whistle F1; b128 has slightly better pitch accuracy (hum 0.944 vs 0.940).
+  These gaps are within what a 512-example val set can resolve, so call them a tie.
+- Cost is the same: b128 ~5.4 h of epoch time on its own GPU, e240 ~5.3 h. With no gain from
+  the larger batch, the default stays 32; train longer instead.
+- Both plateau: e240 is flat from ~epoch 200, b128 from ~50. The ~0.927 ceiling looks like
+  the arch + data with this recipe, not the training length.
+- **For the fine-tune:** use `humnet-long-pretrain-e240` (highest F1; ties on hum). Then
+  compare against `humnet` / `humnet-deep` on held-out speech with `inspect-model`, which is
+  the open question for this arch, rather than on these val numbers.
