@@ -297,8 +297,9 @@ with different flags than it had (look at the pane for the last command line).
   like a small mic; the label stays the fundamental). `HUM_MIX_PRESETS` splits each mix
   between whistle, hum and nothing. Hum clips are then never used as interferers. Mic hum
   clips get the same training-only augmentation as mic whistles.
-  Clips recorded on a tune's page are `whistle` clips with a `tune_id` (try-outs of a written
-  tune, or examples for a fitted template).
+  Clips recorded for a tune (its page, or "Collect data" on the Live page with a tune
+  picked) are `whistle` or `hum` clips with a `tune_id` (try-outs of a written tune, or
+  examples for a fitted template). The two labels are treated alike there.
 * **Mic self-noise: `spectral_gate`.** The USB mic is noisy (steady hiss, ~-35 dBFS). Record
   20-30 s of `silence`, measure a noise profile (manager: the panel under a `spectral_gate`
   filter; CLI: `noise-profile create`), and the gate keeps only bins > `n_std` noise std-devs

@@ -6,13 +6,16 @@ import { LABELS } from '../lib/labels'
 
 const HINTS: Record<string, string> = {
   whistle: 'Clean whistling, quiet room. These become positives (pitch auto-labelled).',
-  hum: 'Clean humming, quiet room. Collected to study hums; for now the whistle detector treats them as hard negatives.',
+  hum: 'Clean humming, quiet room. Positives for the whistle + hum model (pitch auto-labelled); a whistle-only model uses them as hard negatives.',
   speech: 'Talk normally, no whistling. The #1 false-trigger in v1 — collect lots.',
   noise: 'TV, kitchen, doors, typing… anything that is not whistling.',
   music: 'Music playing in the room.',
   silence: 'Room tone.',
   other: 'Unsorted; excluded from training.',
 }
+
+/** Labels that can be a performance of a tune: it is whistled or hummed. */
+const TUNE_LABELS = ['whistle', 'hum']
 
 /** Record clips from the server mic into the dataset. */
 export function RecordPanel({
@@ -45,7 +48,8 @@ export function RecordPanel({
       onSaved?.(r)
     }
   }
-  const meta = { label, tune_id: label === 'whistle' ? tune : null }
+  const tuneful = TUNE_LABELS.includes(label)
+  const meta = { label, tune_id: tuneful ? tune : null }
   const live = status?.state === 'running'
 
   return (
@@ -59,11 +63,11 @@ export function RecordPanel({
             ))}
           </select>
         </label>
-        {tunes && label === 'whistle' && (
+        {tunes && tuneful && (
           <label>
             Tune{' '}
             <select value={tune ?? ''} onChange={(e) => setTune(e.target.value || null)}>
-              <option value="">(none — generic whistle)</option>
+              <option value="">(none — generic {label})</option>
               {tunes.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name}

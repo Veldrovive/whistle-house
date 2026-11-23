@@ -1,8 +1,8 @@
 """Recording dataset: ``<data_dir>/recordings/<id>.wav`` + ``<id>.json`` metadata.
 
 Clip-level ``label`` says what the clip mostly contains. Optional ``segments`` give finer
-time-ranges (e.g. a whistle inside a mostly-speech clip). Tune examples are ``whistle`` clips
-with ``tune_id`` set.
+time-ranges (e.g. a whistle inside a mostly-speech clip). Tune examples are ``whistle`` or
+``hum`` clips with ``tune_id`` set (a tune is whistled or hummed; the two are treated alike).
 
 Recordings are made on the deployment mic (manager Live/Collect page) or uploaded. Labels that
 matter for the learned detector:
