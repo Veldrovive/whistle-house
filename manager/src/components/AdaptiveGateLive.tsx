@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { FilterInfo } from '../api'
 import { profileColor } from '../lib/profileColors'
 import { BinChart } from './NoiseProfilePanel'
@@ -5,6 +6,9 @@ import { BinChart } from './NoiseProfilePanel'
 // Live view of an adaptive_gate filter (Live page, under the spectrogram): which noise
 // profile the room is in over the spectrogram's time window, the current belief, and the
 // noise the gate is using right now against the latest frame at the filter's input.
+// Collapsed (the default; remembered in localStorage) it is one line: the current profile.
+
+const OPEN_KEY = 'whistle-house.adaptiveGateLive.open'
 
 /** Per-frame series buffered on the Live page, aligned with the spectrogram's frames. */
 export type GateBuffer = {
@@ -20,6 +24,11 @@ const STRIP_H = 60
 const FG_H = 16
 
 export function AdaptiveGateLive({ buf, times, info }: { buf: GateBuffer; times: number[]; info?: FilterInfo }) {
+  const [open, setOpen] = useState(() => localStorage.getItem(OPEN_KEY) === '1')
+  const toggle = () => {
+    localStorage.setItem(OPEN_KEY, open ? '0' : '1')
+    setOpen(!open)
+  }
   const n = Math.min(buf.probs.length, times.length)
   const probs = buf.probs.slice(-n)
   const fg = buf.fg.slice(-n)
@@ -65,11 +74,26 @@ export function AdaptiveGateLive({ buf, times, info }: { buf: GateBuffer; times:
   return (
     <div className="card" style={{ background: 'var(--panel2)' }}>
       <div className="row wrap">
-        <b>Background (adaptive_gate, filter {buf.index + 1})</b>
-        <span className="muted small">
-          which noise profile the room is in, per frame; the gate uses the mix of profiles by these probabilities
-        </span>
+        <button className="small" onClick={toggle} aria-expanded={open} title={open ? 'Collapse' : 'Show details'}>
+          {open ? '▾' : '▸'} Background
+        </button>
+        {best >= 0 ? (
+          <span className="small">
+            <b style={{ color: profileColor(best) }}>{buf.profiles[best]}</b> {Math.round(100 * (cur[best] ?? 0))}%
+            {curFg > 0.5 && <span className="warn"> · sound on top</span>}
+          </span>
+        ) : (
+          <span className="muted small">waiting for audio…</span>
+        )}
+        {open && (
+          <span className="muted small">
+            adaptive_gate, filter {buf.index + 1}: which noise profile the room is in, per frame; the gate uses the
+            mix of profiles by these probabilities
+          </span>
+        )}
       </div>
+      {open && (
+        <>
       <svg viewBox="0 0 1000 100" preserveAspectRatio="none" style={{ width: '100%', height: STRIP_H, display: 'block', background: '#000', borderRadius: 4 }}>
         <title>Profile probability over the last seconds</title>
         {areas.map((pts, k) => (
@@ -123,6 +147,8 @@ export function AdaptiveGateLive({ buf, times, info }: { buf: GateBuffer; times:
         foreground / unexplained (a sound on top that fits no profile; the belief over profiles holds meanwhile).
         Chart: dashed lines are each profile's mean, brighter when more likely.
       </div>
+        </>
+      )}
     </div>
   )
 }

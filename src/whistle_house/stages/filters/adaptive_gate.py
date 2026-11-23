@@ -18,12 +18,22 @@ background. Per frame ``x`` (dB per bin):
   ``log[(1 - rise_prob) N(x; mu_k, sd_k) + rise_prob rise_k(x)]``. ``rise_k`` is the profile's
   Gaussian convolved with a uniform rise of 0..``rise_db`` dB: a bin raised by some quiet other
   sound, so one loud bin cannot refute a profile.
+  With ``hold_during_foreground`` (default) the profile transition is applied to the
+  background part of the belief only, so nothing moves the belief while a sound is on top;
+  otherwise it would leak towards uniform at 1/dwell_s per second of talking.
 * Update, foreground (``a = 1``): ``-log(fg_width_db)`` for every profile, i.e. a foreground
   frame says nothing about which profile is on; the belief over profiles just holds while
   someone talks or whistles, instead of jumping to the loudest profile.
-* Bins are not independent, so the per-bin mean log-likelihood is multiplied by
-  ``evidence_fraction * n_bins`` (an effective number of independent bins) before it is turned
-  into a probability.
+* Evidence weights. Bins are not independent, so per-bin mean log-likelihoods are multiplied
+  by an effective number of bins before they become probabilities, and the two questions get
+  different weights. "Is this frame background at all" (best profile against the foreground
+  model) uses ``evidence_fraction * n_bins``. "Which profile" (each profile against the best)
+  uses ``profile_evidence_fraction * n_bins``, about 80x less: frames overlap (n_fft 4096, hop
+  512) and a real room never matches a profile exactly, so frame-to-frame differences between
+  similar profiles are mostly noise. With equal weights (the first version) the belief on the
+  live mic flipped between two similar profiles 456 times in 90 s (median run 0.1 s); at
+  0.003 twice, and a switch on the test clips still settles in 0.2-0.6 s (~1.2 s under
+  speech).
 
 Gate: the predicted noise is the posterior mixture of the profiles, moment-matched in dB
 (``mu = sum w_k mu_k``, ``var = sum w_k (sd_k^2 + (mu_k - mu)^2)``). The gate then does what
@@ -91,8 +101,22 @@ class AdaptiveGate(Filter):
         )
         evidence_fraction: float = Field(
             0.25,
-            description="Effective share of independent bins (bins are correlated): scales "
-            "how strongly one frame moves the belief",
+            description="Effective share of independent bins (bins are correlated) for the "
+            "foreground decision: scales how strongly one frame says 'background only' or "
+            "'something on top'",
+        )
+        profile_evidence_fraction: float = Field(
+            0.003,
+            description="The same for telling the profiles apart, as a share of the bins. Much "
+            "smaller: consecutive frames overlap and a real room never matches a profile "
+            "exactly, so one frame is weak evidence. Larger = switches faster but flickers "
+            "between similar profiles; 0.25 is the old behaviour",
+        )
+        hold_during_foreground: bool = Field(
+            True,
+            description="While a foreground sound is on top, keep the belief over profiles "
+            "exactly where it was (the dwell clock only runs on background frames). Off = the "
+            "belief slowly spreads over all profiles during long talking (1/dwell_s per second)",
         )
         n_std: float = Field(
             2.0, description="Pass bins more than this many noise std-devs above the noise mean"
@@ -178,14 +202,26 @@ class AdaptiveGate(Filter):
         """Run the forward recursion over the frames -> (profile probs (T, K), fg prob (T,))."""
         c = self.config
         T, K = x.shape[0], self._mu.shape[0]
-        scale = c.evidence_fraction * x.shape[1]
+        s_fg = c.evidence_fraction * x.shape[1]
+        s_prof = c.profile_evidence_fraction * x.shape[1]
         l1 = -np.log(c.fg_width_db)
         probs, fg = np.empty((T, K)), np.empty(T)
+        ll = np.zeros((K, 2))  # column 1 (foreground) stays 0: the reference
         for s in range(0, T, _LIK_CHUNK):
             l0 = self._background_loglik(x[s : s + _LIK_CHUNK])
             for j, row in enumerate(l0):
-                p = self._A.T @ self._p @ self._B
-                ll = scale * np.stack([row, np.full(K, l1)], axis=1)
+                p = self._p
+                if c.hold_during_foreground:
+                    # only the background part of the belief may change profile: while a
+                    # sound is on top there is no evidence, so the belief stays put
+                    p = np.stack([self._A.T @ p[:, 0], p[:, 1]], axis=1)
+                else:
+                    p = self._A.T @ p
+                p = p @ self._B
+                best = row.max()
+                # two questions, two evidence weights: is this frame background at all (the
+                # best profile against the foreground model), and which profile is it
+                ll[:, 0] = s_fg * (best - l1) + s_prof * (row - best)
                 p = p * np.exp(ll - ll.max())
                 p /= p.sum()
                 self._p = p

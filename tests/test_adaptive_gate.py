@@ -132,6 +132,24 @@ def test_picks_the_right_profile_and_follows_a_switch(data_dir):
         assert (p[lo:hi].argmax(1) == j).mean() > 0.95, (seg, j)
 
 
+def test_similar_profiles_do_not_flicker(tmp_path):
+    """A room between two similar profiles: the belief must not jump frame to frame."""
+    spec = PipelineSpec(transform=TRANSFORM, filters=[]).model_dump()
+    store = NoiseProfileStore(tmp_path / "noise_profiles")
+    base = _noise(8.0, 0, "quiet")
+    for name, gain in (("a", 1.0), ("b", 1.12)):  # 1 dB apart
+        store.save(profile_from_audio(name, spec, 0, [(name, gain * base)], tmp_path))
+    room = 1.06 * _noise(20.0, 7, "quiet")  # halfway between the two
+
+    def flips(**params):
+        probs, _ = _posteriors(_frontend(tmp_path, ("a", "b"), **params), room)
+        return int((np.diff(probs.argmax(axis=1)) != 0).sum())
+
+    old = flips(profile_evidence_fraction=0.25)  # the first version's behaviour
+    assert old > 20
+    assert flips() * 5 < old
+
+
 @pytest.mark.parametrize("burst", ["speech", "tone"])
 def test_foreground_burst_holds_the_profile(data_dir, burst):
     fe = _frontend(data_dir)

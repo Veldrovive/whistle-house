@@ -110,7 +110,9 @@ manager/             Vite + React + TS manager website
                      music font), Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView
                      (spectrograms + Original/Processed playback), RecordPanel,
                      NoiseProfilePanel (extra controls under a spectral_gate / adaptive_gate
-                     filter), AdaptiveGateLive (Live page: which background the room is in)
+                     filter), AdaptiveGateLive (Live page: which background the room is in) (collapsed
+                     to one line by default), NoiseProfiles (Data page: make a profile from a
+                     silence recording; list, compare, add to a pipeline, delete profiles)
 tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data,
                      augmentation labels, server API, harmonic model (test_harmonic.py),
                      overtone rejection (test_overtones.py), written tunes against simulated
@@ -335,7 +337,8 @@ with different flags than it had (look at the pane for the last command line).
   `rise_prob` 0.05 chance of the bin being raised by 0..`rise_db` 40 dB; a foreground frame has
   a flat `-log(fg_width_db)` (20) for every profile, so speech or a whistle holds the belief over
   profiles instead of moving it; the per-bin mean log-likelihood counts as
-  `evidence_fraction` (0.25) x n_bins independent bins. The gate is `spectral_gate`'s with the
+  `evidence_fraction` (0.25) x n_bins independent bins for "is this frame background at all"
+  and `profile_evidence_fraction` (0.003) x n_bins for "which profile" (see below). The gate is `spectral_gate`'s with the
   posterior mixture of the profiles as the noise (moment-matched mean/std in dB; it smooths
   `x`, not `x - mu`); with one profile it equals `spectral_gate` (tested). The Live page shows
   the per-frame posterior, the foreground probability and the noise in use (`Filter.telemetry`
@@ -349,6 +352,24 @@ with different flags than it had (look at the pane for the last command line).
   behind `spectral_gate` will see different input). A narrow whistle only raises a few bins, so
   it mostly scores as background plus raised bins (foreground stays low), which also keeps the
   belief where it was.
+  **Do not raise `profile_evidence_fraction` to make it "more decisive".** The first version
+  used 0.25 for both questions and flickered: on 90 s from the live mic the top profile
+  changed 456 times (median run 0.1 s), because frames overlap 8x and the room never matches
+  a profile exactly. At 0.003: 2 changes on the same 90 s, half-take accuracy 100%, a switch
+  settles in 0.2-0.6 s (up to ~1.2 s under speech). **Cross-take check** (second silence and
+  fridge takes, 2026-11-23): the two fridge takes agree (0.09 sd per bin) and a fridge profile
+  from one take is right on 100% of the other, 0 flips. The two silence takes do not: the
+  first ("Actually pretty silent", profile `fifine`) has 8.5 dB more below 140 Hz than the
+  second, more than the fridge adds there, so it is a different background (quiet + some low
+  rumble) and the second take scored against the first's profiles is called "fridge" 60-80%
+  of the time. With the second take as its own profile, quiet > fridge > quiet > fridge (15 s
+  each, fridge profile from the other take) gave exactly 3 switches, clean and under
+  synthetic speech. Lesson: every background the room can be in needs a profile, backgrounds
+  combine (rumble x fridge x fan), and a "foreground" bar that stays up in a quiet room means
+  no profile fits. `hold_during_foreground` (default on) applies the profile transition only
+  to the background part of the belief, so the belief does not move while a sound is on top
+  (live capture: belief moved 1.44 per second during foreground in the first version, 0.014
+  now); off, it leaks towards uniform at 1/`dwell_s` per second of talking.
 * **Noise robustness is synthetic.** `data/training.py` mixes clean whistles with interferers at
   random SNR (−3…25 dB), plus random gain, EQ and reverb. Interferers come from negative
   recordings on this mic, files in `data/noise/**`, and `synth_pseudo_speech` (harmonic stacks

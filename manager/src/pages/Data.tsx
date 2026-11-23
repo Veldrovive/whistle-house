@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api, type Recording } from '../api'
 import { AnalysisView } from '../components/AnalysisView'
+import { MakeProfileForm, NoiseProfileManager } from '../components/NoiseProfiles'
 import { LABELS } from '../lib/labels'
 import { fmtDate, fmtS, useAction, useLoad } from '../lib/hooks'
 
@@ -12,11 +13,23 @@ export function Data() {
   const stats = useLoad(() => api.recordingStats(), [])
   const tunes = useLoad(() => api.tunes(), [])
   const pipelines = useLoad(() => api.pipelines(), [])
+  const profiles = useLoad(() => api.noiseProfiles(), [])
+  const silence = useLoad(() => api.recordings({ label: 'silence' }), [])
+  const noise = {
+    profiles: profiles.data ?? [],
+    pipelines: pipelines.data?.pipelines ?? [],
+    active: pipelines.data?.active ?? null,
+    onChange: () => {
+      profiles.reload()
+      pipelines.reload()
+    },
+  }
   const act = useAction()
   const [upLabel, setUpLabel] = useState('whistle')
 
   const reload = () => {
     recs.reload()
+    silence.reload()
     stats.reload()
   }
   const update = async (patch: Partial<Recording>) => {
@@ -63,6 +76,8 @@ export function Data() {
         />
         {act.error && <span className="error">{act.error}</span>}
       </div>
+
+      <NoiseProfileManager {...noise} silence={silence.data ?? []} />
 
       <div className="split">
         <div className="list">
@@ -147,6 +162,7 @@ export function Data() {
                 onBlur={(e) => e.target.value !== selected.notes && update({ notes: e.target.value })}
               />
             </label>
+            {selected.label === 'silence' && <MakeProfileForm key={selected.id} {...noise} recording={selected} />}
             <label>
               Analyse with{' '}
               <select value={pipeline} onChange={(e) => setPipeline(e.target.value)}>
