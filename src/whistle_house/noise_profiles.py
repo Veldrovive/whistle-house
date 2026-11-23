@@ -1,4 +1,7 @@
-"""Noise profiles: per-bin statistics of the mic's background noise, for the ``spectral_gate`` filter.
+"""Noise profiles: per-bin statistics of the mic's background noise, for the gate filters.
+
+``spectral_gate`` uses one profile, ``adaptive_gate`` several (one per background: quiet,
+fridge, fan, ...) and tracks which one is on.
 
 A profile is measured by running "silence" recordings (room tone, the mic's own hiss) through the
 part of a pipeline *upstream* of where the filter sits (transform + the filters before it), then
@@ -180,10 +183,24 @@ def profile_from_audio(
     )
 
 
+GATE_FILTERS = ("spectral_gate", "adaptive_gate")  # filters that use noise profiles
+
+
+def filter_profiles(f: dict) -> list[str]:
+    """Noise profile names a filter spec ({name, params}) uses (none for other filters)."""
+    params = f.get("params") or {}
+    if f.get("name") == "spectral_gate":
+        return [params["profile"]] if params.get("profile") else []
+    if f.get("name") == "adaptive_gate":
+        return [p for p in params.get("profiles") or [] if p]
+    return []
+
+
 def gate_position(spec_dict: dict) -> int:
-    """Where a profile for this pipeline is measured: at its first spectral_gate, else the end."""
+    """Where a profile for this pipeline is measured: at its first gate filter
+    (spectral_gate or adaptive_gate), else the end."""
     for i, f in enumerate(spec_dict["filters"]):
-        if f["name"] == "spectral_gate":
+        if f["name"] in GATE_FILTERS:
             return i
     return len(spec_dict["filters"])
 
@@ -208,15 +225,24 @@ def profile_from_recordings(
 
 
 def attach_gate(spec_dict: dict, profile: str, position: int | None = None) -> dict:
-    """Copy of the spec with a spectral_gate using ``profile`` at ``position``.
+    """Copy of the spec with a gate using ``profile`` at ``position``.
 
-    An existing spectral_gate at that position keeps its other params; otherwise one is inserted.
+    An existing spectral_gate at that position is pointed at the profile, an existing
+    adaptive_gate gets it added to its list (other params kept); otherwise a spectral_gate is
+    inserted.
     """
     spec = json.loads(json.dumps(spec_dict))
     filters = spec["filters"]
     pos = gate_position(spec) if position is None else position
     if pos < len(filters) and filters[pos]["name"] == "spectral_gate":
         filters[pos]["params"] = {**filters[pos].get("params", {}), "profile": profile}
+    elif pos < len(filters) and filters[pos]["name"] == "adaptive_gate":
+        params = filters[pos].get("params", {})
+        names = list(params.get("profiles") or [])
+        filters[pos]["params"] = {
+            **params,
+            "profiles": names if profile in names else [*names, profile],
+        }
     else:
         filters.insert(pos, {"name": "spectral_gate", "params": {"profile": profile}})
     return spec

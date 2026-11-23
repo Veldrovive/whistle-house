@@ -45,6 +45,18 @@ def encode_block(block: FrameBlock) -> dict:
     }
 
 
+def merge_filter_state(acc: dict[int, dict], states: list[dict]) -> None:
+    """Accumulate filter telemetry between publishes: per-frame ``series`` lists are
+    concatenated, every other key keeps its latest value (see ``Filter.telemetry``)."""
+    for st in states:
+        prev = acc.get(st["index"])
+        series = dict(st.get("series") or {})
+        if prev is not None and prev.get("name") == st["name"]:
+            for k, v in series.items():
+                series[k] = prev["series"].get(k, []) + v
+        acc[st["index"]] = {**st, "series": series}
+
+
 class LiveEngine:
     RING_SECONDS = 60
     PUBLISH_INTERVAL_S = 0.1
@@ -116,6 +128,8 @@ class LiveEngine:
             "pipeline": self.spec.model_dump(mode="json") if self.spec else None,
             "raw_axis": p.frontend.transform.axis.to_json() if p else None,
             "axis": p.axis.to_json() if p else None,
+            # static info of filters that report live state (adaptive_gate: profile means)
+            "filter_info": p.frontend.telemetry_info() if p else [],
         }
 
     def start(self) -> None:
@@ -274,6 +288,7 @@ class LiveEngine:
         kind_scores: dict[str, list[np.ndarray]] = {}
         events: list[dict] = []
         active: list[dict] = []
+        filter_state: dict[int, dict] = {}  # filter index -> accumulated telemetry
         assert self._source is not None
         try:
             for chunk in self._source:
@@ -300,6 +315,7 @@ class LiveEngine:
                     kind_scores.setdefault(kind, []).append(ks)
                 events += [e.to_json() for e in r.detection.events]
                 active = [e.to_json() for e in r.detection.active]
+                merge_filter_state(filter_state, r.filter_state)
                 for m in r.matches:
                     self._handle_match(m)
                 now = time.monotonic()
@@ -317,12 +333,14 @@ class LiveEngine:
                             },
                             "events": events,
                             "active": active,
+                            "filter_state": list(filter_state.values()),
                             "now": pipeline.now,
                         }
                     )
                 if now - last_pub >= self.PUBLISH_INTERVAL_S:
                     raw_blocks, filt_blocks, scores, events = [], [], [], []
                     kind_scores = {}
+                    filter_state = {}
                     last_pub = now
         except Exception as e:
             log.exception("live engine crashed")

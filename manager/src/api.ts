@@ -130,6 +130,38 @@ export type HumPitch = {
   f0_p95?: number
 }
 
+/** Live state of one filter for the frames of a websocket "frames" message
+ *  (Filter.telemetry on the server). `series` holds one entry per frame. */
+export type FilterState = {
+  index: number // position in pipeline.filters
+  name: string
+  series: Record<string, unknown[]>
+  [key: string]: unknown
+}
+/** adaptive_gate's live state: which noise profile the room is in, per frame. */
+export type AdaptiveGateState = FilterState & {
+  name: 'adaptive_gate'
+  profiles: string[]
+  series: { probs: number[][]; foreground: number[] }
+  mu: number[] | null // effective noise mean (dB per bin) of the latest frame
+  input: number[] | null // latest frame at the filter's input (dB per bin)
+}
+/** Static drawing info of filters with live state (websocket "config" message). */
+export type FilterInfo = {
+  index: number
+  name: string
+  profiles?: string[]
+  means?: number[][] // adaptive_gate: each profile's noise mean per bin
+  freqs?: number[] | null // the filter's input axis
+}
+/** websocket "config" message: the active pipeline and its axes */
+export type LiveConfig = {
+  pipeline: PipelineSpec
+  axis: Axis
+  raw_axis: Axis
+  filter_info?: FilterInfo[]
+}
+
 export type Analysis = {
   pipeline: PipelineSpec
   raw_axis: Axis
@@ -213,7 +245,7 @@ export type DatasetsInfo = {
   mixes: Record<string, Record<string, number>>
 }
 
-/** Per-bin noise statistics measured from silence recordings (spectral_gate filter). */
+/** Per-bin noise statistics measured from silence recordings (spectral_gate / adaptive_gate). */
 export type NoiseProfile = {
   name: string
   freqs: number[]

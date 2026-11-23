@@ -23,7 +23,11 @@ from pydantic import BaseModel, Field
 from whistle_house.audio.io import to_mono_float
 from whistle_house.audio.sources import list_input_devices
 from whistle_house.data.store import LABELS, Recording, RecordingStore, RecordingUpdate
-from whistle_house.noise_profiles import NoiseProfileStore, profile_from_recordings
+from whistle_house.noise_profiles import (
+    NoiseProfileStore,
+    filter_profiles,
+    profile_from_recordings,
+)
 from whistle_house.outputs import OutputInstance, OutputStore, list_output_types
 from whistle_house.pipeline import Pipeline, PipelineSpec, PipelineStore
 from whistle_house.server.engine import LiveEngine, encode_block
@@ -88,7 +92,7 @@ class NoiseProfileBody(BaseModel):
     name: str
     recording_ids: list[str]
     spec: PipelineSpec  # the (possibly unsaved) pipeline the profile is for
-    position: int | None = None  # filter index of the gate (default: its spectral_gate, else end)
+    position: int | None = None  # filter index of the gate (default: its first gate, else end)
 
 
 class AppState:
@@ -250,7 +254,7 @@ def create_app(
         users = [
             p.name
             for p in S.pipelines.list()
-            if any(f.name == "spectral_gate" and f.params.get("profile") == name for f in p.filters)
+            if any(name in filter_profiles(f.model_dump()) for f in p.filters)
         ]
         if users:
             raise HTTPException(400, f"noise profile {name!r} is used by pipelines {users}")

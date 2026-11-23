@@ -60,6 +60,7 @@ from whistle_house.data.augment import (
     warp_clip,
 )
 from whistle_house.data.store import NEGATIVE_LABELS, RecordingStore
+from whistle_house.noise_profiles import filter_profiles
 from whistle_house.pipeline import Frontend
 from whistle_house.stages.base import StageContext, build_stage
 from whistle_house.threads import limit_worker_threads
@@ -252,10 +253,10 @@ def frontend_hash(frontend_spec: dict, labeler_params: dict, data_dir: Path | No
     blob = json.dumps({"f": frontend_spec, "l": labeler_params}, sort_keys=True)
     if data_dir is not None:
         for f in frontend_spec.get("filters", []):
-            prof = f.get("params", {}).get("profile") if f.get("name") == "spectral_gate" else None
-            p = data_dir / "noise_profiles" / f"{prof}.json"
-            if prof and p.exists():
-                blob += hashlib.sha1(p.read_bytes()).hexdigest()
+            for prof in filter_profiles(f):
+                p = data_dir / "noise_profiles" / f"{prof}.json"
+                if p.exists():
+                    blob += hashlib.sha1(p.read_bytes()).hexdigest()
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 

@@ -319,7 +319,10 @@ def cmd_noise_create(args) -> None:
         pipes.put(new)
         print(f"pipeline {new.name}: filters now {[f.name for f in new.filters]}")
     else:
-        print(f"use it with a spectral_gate filter at position {pos} (or re-run with --add)")
+        print(
+            f"use it with a spectral_gate (or add it to an adaptive_gate's profiles) at "
+            f"position {pos}, or re-run with --add"
+        )
 
 
 def cmd_noise_delete(args) -> None:
@@ -522,7 +525,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.set_defaults(fn=cmd_warmstart)
 
-    p = sub.add_parser("noise-profile", help="noise profiles for the spectral_gate filter")
+    p = sub.add_parser(
+        "noise-profile", help="noise profiles for the spectral_gate / adaptive_gate filters"
+    )
     nsub = p.add_subparsers(dest="ncmd", required=True)
     q = nsub.add_parser("list", help="show saved noise profiles")
     q.set_defaults(fn=cmd_noise_list)
@@ -535,9 +540,15 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument(
         "--position",
         type=int,
-        help="filter index the gate sits at (default: the pipeline's spectral_gate, else the end)",
+        help="filter index the gate sits at (default: the pipeline's first spectral_gate or "
+        "adaptive_gate, else the end)",
     )
-    q.add_argument("--add", action="store_true", help="also add/point a spectral_gate at it")
+    q.add_argument(
+        "--add",
+        action="store_true",
+        help="also point the gate at it (spectral_gate: replace its profile; adaptive_gate: add it "
+        "to its profiles; none there: insert a spectral_gate)",
+    )
     q.set_defaults(fn=cmd_noise_create)
     q = nsub.add_parser("delete", help="delete a noise profile")
     q.add_argument("name")

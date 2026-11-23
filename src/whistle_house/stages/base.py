@@ -105,6 +105,19 @@ class Filter(Stage):
     @abstractmethod
     def process(self, block: FrameBlock) -> FrameBlock: ...
 
+    def telemetry(self) -> dict | None:
+        """Optional JSON-able state for the frames of the last ``process()`` call (Live page).
+
+        Per-frame lists go under ``"series"`` (``{key: [one entry per frame]}``): the live
+        engine concatenates them across steps. Every other key is "latest value" and is
+        overwritten. None (the default) = nothing to show.
+        """
+        return None
+
+    def telemetry_info(self) -> dict | None:
+        """Optional JSON-able static info for drawing the telemetry (sent once per config)."""
+        return None
+
 
 class WhistleDetector(Stage):
     """FrameBlock -> whistle events (+ per-frame scores for visualisation)."""

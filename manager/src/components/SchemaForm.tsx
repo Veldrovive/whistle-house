@@ -9,6 +9,8 @@ type Props = {
   schema: JsonSchema
   value: Record<string, unknown>
   onChange: (v: Record<string, unknown>) => void
+  /** fields edited by a dedicated panel instead (e.g. adaptive_gate's `profiles`) */
+  hide?: string[]
 }
 
 function nullableOf(s: JsonSchema): JsonSchema | null {
@@ -80,8 +82,8 @@ function Field({
   return <JsonField value={value} onChange={onChange} />
 }
 
-export function SchemaForm({ schema, value, onChange }: Props) {
-  const props = schema.properties ?? {}
+export function SchemaForm({ schema, value, onChange, hide }: Props) {
+  const props = Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([k]) => !hide?.includes(k)))
   if (!Object.keys(props).length) return <div className="muted small">no parameters</div>
   return (
     <div className="form-grid">

@@ -2,14 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import {
   api,
   decodeBlock,
-  type Axis,
+  type AdaptiveGateState,
   type EngineStatus,
   type EventJson,
+  type FilterState,
   type KindScores,
+  type LiveConfig,
   type MatchJson,
-  type PipelineSpec,
   type Tune,
 } from '../api'
+import { AdaptiveGateLive, type GateBuffer } from '../components/AdaptiveGateLive'
 import { RecordPanel } from '../components/RecordPanel'
 import { Spectrogram } from '../components/Spectrogram'
 import { useAction, useLoad } from '../lib/hooks'
@@ -40,7 +42,7 @@ function flatten(buf: Buf, nBins: number): Float32Array {
 
 export function Live() {
   const [view, setView] = useState<'filtered' | 'raw'>('filtered')
-  const [cfg, setCfg] = useState<{ pipeline: PipelineSpec; axis: Axis; raw_axis: Axis } | null>(null)
+  const [cfg, setCfg] = useState<LiveConfig | null>(null)
   const [, setTick] = useState(0)
   const [connected, setConnected] = useState(false)
   const [matches, setMatches] = useState<MatchJson[]>([])
@@ -50,6 +52,7 @@ export function Live() {
   const kindScores = useRef<KindScores>({})
   const events = useRef<EventJson[]>([])
   const active = useRef<EventJson[]>([])
+  const gates = useRef<GateBuffer[]>([]) // adaptive_gate state per filter, buffered like scores
 
   const status = useLoad(() => api.status(), [])
   const pipelines = useLoad(() => api.pipelines(), [])
@@ -77,6 +80,7 @@ export function Live() {
           scores.current = []
           kindScores.current = {}
           events.current = []
+          gates.current = []
         } else if (msg.type === 'frames') {
           append(raw.current, decodeBlock(msg.raw), msg.raw.n_frames, msg.raw.n_bins, msg.raw.times)
           append(filt.current, decodeBlock(msg.filtered), msg.filtered.n_frames, msg.filtered.n_bins, msg.filtered.times)
@@ -89,6 +93,20 @@ export function Live() {
           const t0 = filt.current.times[0] ?? 0
           events.current = events.current.concat(msg.events).filter((e) => e.end >= t0)
           active.current = msg.active
+          const keep = filt.current.times.length
+          gates.current = ((msg.filter_state ?? []) as FilterState[])
+            .filter((f): f is AdaptiveGateState => f.name === 'adaptive_gate')
+            .map((f) => {
+              const prev = gates.current.find((g) => g.index === f.index)
+              return {
+                index: f.index,
+                profiles: f.profiles,
+                probs: (prev?.probs ?? []).concat(f.series.probs).slice(-keep),
+                fg: (prev?.fg ?? []).concat(f.series.foreground).slice(-keep),
+                mu: f.mu ?? prev?.mu ?? null,
+                input: f.input ?? prev?.input ?? null,
+              }
+            })
           setTick((t) => t + 1)
         } else if (msg.type === 'match') {
           setMatches((ms) => [msg.match, ...ms].slice(0, 50))
@@ -174,6 +192,14 @@ export function Live() {
       ) : (
         <div className="spec empty">waiting for audio…</div>
       )}
+      {gates.current.map((g) => (
+        <AdaptiveGateLive
+          key={g.index}
+          buf={g}
+          times={buf.times}
+          info={cfg?.filter_info?.find((f) => f.index === g.index)}
+        />
+      ))}
       <div className="muted small">
         Lines: finished notes (<span className="kind-whistle-text">whistled</span>,{' '}
         <span className="kind-hum-text">hummed</span>) · dashed: in progress · trace along the bottom: detector

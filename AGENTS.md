@@ -58,14 +58,18 @@ src/whistle_house/
   settings.py        .env loading; data dir (WHISTLE_HOUSE_DATA) + external root (WHISTLE_HOUSE_EXTERNAL)
   tunes.py           Tune model (Score = sheet music, or a template fitted from examples),
                      TuneLibrary (data/tunes.json), note-template fitting
-  noise_profiles.py  per-bin silence stats for spectral_gate (data/noise_profiles/<name>.json)
+  noise_profiles.py  per-bin silence stats for spectral_gate / adaptive_gate
+                     (data/noise_profiles/<name>.json); filter_profiles = which a filter uses
   cli.py             `whistle-house` CLI: serve, devices, analyze, import, datasets, train-detector, warmstart
   stages/
-    base.py          stage ABCs + registry (register, build_stage, list_stages)
+    base.py          stage ABCs + registry (register, build_stage, list_stages);
+                     Filter.telemetry/telemetry_info: optional live state for the Live page
     transforms/stft.py   StreamingSTFT core + stft_mel (v1 port) + stft_linear + stft_log
                          (60 Hz-4 kHz, 24 bins/octave, n_fft 4096: covers hums and whistles)
     filters/basic.py     identity, noise_floor, frame_median, band_reject
     filters/spectral_gate.py  gate against a measured noise profile (needs a silence recording)
+    filters/adaptive_gate.py  several profiles (quiet, fridge, fan...): a Bayes filter tracks
+                              which one is on per frame and gates with it (see "Adaptive gate")
     detectors/common.py  ContourTracker (links per-frame pitch candidates into notes),
                          drop_harmonics (which peaks of a frame are overtones)
     detectors/peak_tracker.py  heuristic baseline (also auto-labels clean whistle pitch)
@@ -105,13 +109,14 @@ manager/             Vite + React + TS manager website
   src/components/    ScoreEditor (sheet-music editor, VexFlow; lazy-loaded, ~900 kB with its
                      music font), Spectrogram (canvas + SVG overlays), SchemaForm, AnalysisView
                      (spectrograms + Original/Processed playback), RecordPanel,
-                     NoiseProfilePanel (extra controls under a spectral_gate filter)
+                     NoiseProfilePanel (extra controls under a spectral_gate / adaptive_gate
+                     filter), AdaptiveGateLive (Live page: which background the room is in)
 tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, noise gate, external data,
                      augmentation labels, server API, harmonic model (test_harmonic.py),
                      overtone rejection (test_overtones.py), written tunes against simulated
                      performances (test_score_align.py), model report (test_inspect.py),
                      ONNX export == torch + thread limit (test_onnx.py),
-                     mic watchdog (test_engine_watchdog.py)
+                     mic watchdog (test_engine_watchdog.py), adaptive_gate (test_adaptive_gate.py)
 .env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines,
                      reports/<model>/ = model reports)
@@ -320,6 +325,30 @@ with different flags than it had (look at the pane for the last command line).
   (`noise_floor`: 30 in 28 s) and, unlike `noise_floor`, does not swallow long held notes.
   Profiles are measured at the filter's position (upstream chain is fingerprinted; a mismatch
   refuses to build) and are immutable: make a new one when the mic, gain or room changes.
+* **Several backgrounds: `adaptive_gate`.** A room has more than one steady background
+  (quiet, fridge running, bathroom fan with the door open / closed). `adaptive_gate` holds one
+  profile per background (`profiles`, all measured at its position: record a `silence` take of
+  each, with notes saying which, and measure one profile per background in the panel under the
+  filter) and runs a discrete Bayes filter (HMM forward pass) over (profile, foreground) per
+  frame: profiles switch rarely (`dwell_s` 20), foreground comes and goes (`fg_onset_s` 0.5,
+  `fg_release_s` 0.7); a background frame is scored per bin as the profile's Gaussian plus a
+  `rise_prob` 0.05 chance of the bin being raised by 0..`rise_db` 40 dB; a foreground frame has
+  a flat `-log(fg_width_db)` (20) for every profile, so speech or a whistle holds the belief over
+  profiles instead of moving it; the per-bin mean log-likelihood counts as
+  `evidence_fraction` (0.25) x n_bins independent bins. The gate is `spectral_gate`'s with the
+  posterior mixture of the profiles as the noise (moment-matched mean/std in dB; it smooths
+  `x`, not `x - mu`); with one profile it equals `spectral_gate` (tested). The Live page shows
+  the per-frame posterior, the foreground probability and the noise in use (`Filter.telemetry`
+  -> `StepResult.filter_state` -> `filter_state` in the websocket "frames" message). On the 5
+  real Fifine silence takes (quiet, fridge, fan door open / closed / two doors closed;
+  profiles from the first half of each take, scored on the second half, after the first 2 s)
+  the right profile won on 96-100% of frames, clean and with synthetic speech, whistle, hum or
+  white-noise bursts on top (mean 99.1%). Caveats: the foreground was synthetic, train and test
+  halves came from the same take, not yet timed on the Pi (on a Mac the front end with it costs
+  ~0.07 ms per frame), and no model has been trained behind it (checkpoints trained ungated or
+  behind `spectral_gate` will see different input). A narrow whistle only raises a few bins, so
+  it mostly scores as background plus raised bins (foreground stays low), which also keeps the
+  belief where it was.
 * **Noise robustness is synthetic.** `data/training.py` mixes clean whistles with interferers at
   random SNR (−3…25 dB), plus random gain, EQ and reverb. Interferers come from negative
   recordings on this mic, files in `data/noise/**`, and `synth_pseudo_speech` (harmonic stacks

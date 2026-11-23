@@ -12,6 +12,9 @@ const SLOT_HELP: Record<StageKind, string> = {
   recognizer: 'Whistle events → tune matches',
 }
 
+// params edited by the panel under the stage rather than by the generic form
+const PANEL_FIELDS: Record<string, string[]> = { adaptive_gate: ['profiles'] }
+
 function StageEditor({
   kind,
   spec,
@@ -53,7 +56,12 @@ function StageEditor({
         )}
       </div>
       {info ? (
-        <SchemaForm schema={info.schema} value={spec.params} onChange={(params) => onChange({ ...spec, params })} />
+        <SchemaForm
+          schema={info.schema}
+          value={spec.params}
+          onChange={(params) => onChange({ ...spec, params })}
+          hide={PANEL_FIELDS[spec.name]}
+        />
       ) : (
         <div className="error">unknown stage {spec.name}</div>
       )}
@@ -161,13 +169,15 @@ export function Pipelines() {
             set({ filters: fs })
           }}
         >
-          {f.name === 'spectral_gate' && (
+          {(f.name === 'spectral_gate' || f.name === 'adaptive_gate') && (
             <NoiseProfilePanel
+              key={f.name}
               spec={edit}
               index={i}
               params={f.params}
               onParams={(params) => set({ filters: edit.filters.map((x, j) => (j === i ? { ...x, params } : x)) })}
               recordings={recs.data ?? []}
+              multi={f.name === 'adaptive_gate'}
             />
           )}
         </StageEditor>

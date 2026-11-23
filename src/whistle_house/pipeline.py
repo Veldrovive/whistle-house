@@ -116,6 +116,24 @@ class Frontend:
             out = f.process(out)
         return raw, out
 
+    def telemetry(self) -> list[dict]:
+        """Filter telemetry for the last ``push`` ({index, name, ...} per filter that has some)."""
+        out = []
+        for i, f in enumerate(self.filters):
+            t = f.telemetry()
+            if t is not None:
+                out.append({"index": i, "name": f.name, **t})
+        return out
+
+    def telemetry_info(self) -> list[dict]:
+        """Static drawing info of the filters that report telemetry ({index, name, ...})."""
+        out = []
+        for i, f in enumerate(self.filters):
+            t = f.telemetry_info()
+            if t is not None:
+                out.append({"index": i, "name": f.name, **t})
+        return out
+
     def process_signal(self, samples: np.ndarray) -> tuple[FrameBlock, FrameBlock]:
         """Whole signal from a fresh state (identical to streaming it chunk by chunk)."""
         self.reset()
@@ -128,6 +146,8 @@ class StepResult:
     filtered: FrameBlock
     detection: DetectorOutput
     matches: list[TuneMatch]
+    # Frontend.telemetry(): per-filter state for these frames (e.g. adaptive_gate's posterior)
+    filter_state: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -176,7 +196,7 @@ class Pipeline:
         raw, filtered = self.frontend.push(samples)
         det = self.detector.process(filtered)
         matches = self.recognizer.process(det.events, self.now, det.active)
-        return StepResult(raw, filtered, det, matches)
+        return StepResult(raw, filtered, det, matches, self.frontend.telemetry())
 
     def flush(self) -> tuple[list[WhistleEvent], list[TuneMatch]]:
         events = self.detector.flush()
