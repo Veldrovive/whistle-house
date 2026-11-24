@@ -103,7 +103,129 @@ def random_reverb(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarra
     return fftconvolve(x, ir)[: len(x)].astype(np.float32)
 
 
+def channel_response_db(freqs: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """A random smooth frequency response in dB at ``freqs`` (Hz): what a microphone, its
+    distance and angle, and a room do to a source.
+
+    A tilt (up to 4 dB per octave either way), one or two shelves (up to 20 dB, corner
+    80 Hz-1.5 kHz) and a few broad bumps. The range is set by a measured case: the same voice
+    on a USB condenser across a room had 13-18 dB less at 250 Hz-2.5 kHz, relative to its
+    fundamental, than on a laptop mic, and ~28 dB less than audiobook speech. That alone made
+    a model trained without this call 10-36% of speech frames a hum (notebook 2026-11-23).
+    """
+    lf = np.log2(np.maximum(np.asarray(freqs, np.float64), 20.0))
+    g = rng.uniform(-4.0, 4.0) * (lf - np.log2(rng.uniform(100.0, 1000.0)))
+    for _ in range(int(rng.integers(1, 3))):
+        fc = rng.uniform(np.log2(80.0), np.log2(1500.0))
+        g += rng.uniform(-20.0, 20.0) / (1.0 + np.exp(-(lf - fc) / rng.uniform(0.15, 1.0)))
+    for _ in range(int(rng.integers(0, 4))):
+        fc = rng.uniform(np.log2(60.0), np.log2(6000.0))
+        g += rng.uniform(-10.0, 10.0) * np.exp(-0.5 * ((lf - fc) / rng.uniform(0.15, 0.8)) ** 2)
+    band = (freqs > 60) & (freqs < 4000)
+    if band.any():
+        g -= g[band].mean()
+    return np.clip(g, -40.0, 40.0)
+
+
+def random_channel(x: np.ndarray, sr: int, rng: np.random.Generator) -> np.ndarray:
+    """Pass ``x`` through a random ``channel_response_db`` (zero phase). Loudness is kept."""
+    if len(x) < 16 or not x.any():
+        return x
+    spec = np.fft.rfft(x.astype(np.float64))
+    g = channel_response_db(np.fft.rfftfreq(len(x), 1.0 / sr), rng)
+    y = np.fft.irfft(spec * 10 ** (g / 20), len(x))
+    return (y * rms(x) / rms(y)).astype(np.float32)
+
+
+def room_reverb(
+    x: np.ndarray,
+    sr: int,
+    rng: np.random.Generator,
+    rt60_s: tuple[float, float] = (0.15, 0.9),
+    drr_db: tuple[float, float] = (-6.0, 18.0),
+) -> np.ndarray:
+    """A source somewhere in a room: the direct sound plus a decaying tail, with a chosen
+    direct-to-reverberant ratio (18 dB = close to the mic, -6 dB = across the room).
+
+    ``random_reverb`` has almost no direct sound (20-35 dB below its tail); this one covers
+    near to far. The tail is darker than the direct sound, as rooms absorb highs faster.
+    Loudness is kept."""
+    if not x.any():
+        return x
+    rt60 = rng.uniform(*rt60_s)
+    n = int(rt60 * sr)
+    t = np.arange(n) / sr
+    tail = rng.standard_normal(n) * np.exp(-6.9 * t / rt60)
+    b, a = butter(1, rng.uniform(1500, 8000), btype="low", fs=sr)
+    tail = lfilter(b, a, tail)
+    tail[: int(rng.uniform(0.002, 0.02) * sr)] = 0.0  # the first reflection takes a while
+    tail *= 10 ** (-rng.uniform(*drr_db) / 20) / np.sqrt(np.sum(tail**2) + 1e-12)
+    tail[0] = 1.0
+    y = fftconvolve(x, tail)[: len(x)]
+    return (y * rms(x) / rms(y)).astype(np.float32)
+
+
+def active_level_db(x: np.ndarray, sr: int, frame_s: float = 0.05) -> float:
+    """Level of the loud parts of ``x`` in dBFS: the 95th percentile of its 50 ms frame RMS.
+    Unlike the plain RMS it does not depend on how much of the clip is silent."""
+    n = max(1, int(frame_s * sr))
+    m = len(x) // n
+    if m == 0:
+        return 20 * np.log10(rms(x))
+    e = np.mean(np.square(x[: m * n].reshape(m, n), dtype=np.float64), axis=1)
+    return float(10 * np.log10(np.percentile(e, 95) + 1e-12))
+
+
 # --------------------------------------------------------------------------- synthesis
+
+
+MAINS_HZ = (50.0, 60.0, 100.0, 120.0)  # mains and its second harmonic (transformers, lamps)
+
+
+def synth_background(sr: int, n: int, rng: np.random.Generator) -> np.ndarray:
+    """A room's steady background, ``n`` samples at unit RMS: coloured noise (often heavy at
+    the bottom, as room rumble is) plus up to three steady tonal sources.
+
+    The tonal sources are what a noise gate is for and what a hum detector must not report:
+    mains hum, a fan or a fridge motor. Each is a tone or a harmonic series that does not
+    move: pitch within 0.1%, level within a few dB (sometimes a slow beat against a weaker
+    neighbour a fraction of a Hz away). A hummed note has an onset and wanders far more.
+    Measured case (Fifine, 2026-11-24): a 120 Hz tone 16 dB over its neighbours with a
+    per-bin std of 1.1 dB over 30 s, carrying about as much power as the rest of the room
+    noise; ``humnet-long-room2`` drew a hum note along it."""
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    g = channel_response_db(freqs, rng)
+    g -= rng.uniform(0.0, 6.0) * np.log2(np.maximum(freqs, 50.0) / 1000.0)  # rumble
+    g[freqs < 20.0] = -80.0  # nothing a microphone passes, and it would set the level
+    noise = np.fft.irfft(np.fft.rfft(rng.standard_normal(n)) * 10 ** (g / 20), n)
+    out = noise / max(rms(noise), 1e-12)
+    t = np.arange(n) / sr
+    grid = 1.0 + rng.normal(0.0, 0.002)  # everything on the mains is locked to one frequency
+    for _ in range(int(rng.integers(0, 4))):
+        mains = rng.random() < 0.4
+        if mains:
+            f0 = float(rng.choice(MAINS_HZ)) * grid
+        else:
+            f0 = float(2 ** rng.uniform(np.log2(45.0), np.log2(1500.0)))
+        n_h = int(rng.integers(1, 9)) if f0 < 500 else int(rng.integers(1, 4))
+        top = rng.uniform(-20.0, 15.0)  # strongest partial, dB re the noise's RMS
+        roll = rng.uniform(0.0, 12.0)  # dB lost per harmonic
+        drift = 1.0 + (0.0 if mains else rng.uniform(0.0, 1e-3)) * np.sin(
+            2 * np.pi * rng.uniform(0.05, 0.5) * t + rng.uniform(0, 2 * np.pi)
+        )
+        phase = 2 * np.pi * f0 * np.cumsum(drift) / sr
+        beat = rng.uniform(0.2, 3.0) if rng.random() < 0.2 else 0.0
+        for k in range(1, n_h + 1):
+            if k * f0 > 0.45 * sr:
+                break
+            amp = 10 ** ((top - roll * (k - 1) + (rng.normal(0.0, 4.0) if k > 1 else 0.0)) / 20)
+            tone = np.sin(k * phase + rng.uniform(0, 2 * np.pi))
+            if beat:
+                tone = tone + 10 ** (-rng.uniform(10.0, 25.0) / 20) * np.sin(
+                    k * phase + 2 * np.pi * beat * t + rng.uniform(0, 2 * np.pi)
+                )
+            out = out + np.sqrt(2.0) * amp * tone
+    return (out / max(rms(out), 1e-12)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- labelled-clip augmentation

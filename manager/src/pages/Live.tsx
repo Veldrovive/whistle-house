@@ -203,7 +203,8 @@ export function Live() {
       <div className="muted small">
         Lines: finished notes (<span className="kind-whistle-text">whistled</span>,{' '}
         <span className="kind-hum-text">hummed</span>) · dashed: in progress · trace along the bottom: detector
-        score (one per kind, in its colour, for detectors that tell them apart).
+        score (one per kind, in its colour, for detectors that tell them apart;{' '}
+        <span className="kind-speech-text">dotted: speech</span>, for models with a speech head).
       </div>
 
       <h3>Collect data</h3>

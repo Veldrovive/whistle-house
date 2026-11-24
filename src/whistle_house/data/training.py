@@ -22,14 +22,25 @@ tracks. Hum positives are labelled by pYIN on the waveform (``data/hum_labels.py
 does not depend on the front-end. External clips whose labels cover too little of the clip
 (noisy/failed tracking) are dropped.
 
+``GeneratorConfig.aux`` adds presence-only label columns after the f0 columns. The one that
+exists is ``speech``: 1 in the frames where a speech interferer is sounding (``speech_activity``
+on the speech as it sits in the mix), 0 elsewhere, -1 = "don't train on this frame" (speech too
+far under the rest of the mix to say, or a source that may or may not count as speech).
+
 Each example: pick a clean source by the mix probabilities (``GeneratorConfig``), mix in a
 random interferer at a random SNR, randomise gain/EQ/reverb, run the front-end, and sample the
 f0 labels at the frame times.
+
+The ``*-gate`` augment presets also put a steady room background under the example (a mic
+``silence`` take or ``synth_background``) and pass half of the examples through a spectral gate
+with a noise profile measured on a stretch of that background, so the model sees the frames a
+pipeline with ``spectral_gate`` / ``adaptive_gate`` gives it as well as ungated ones.
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import multiprocessing as mp
@@ -44,16 +55,20 @@ import soundfile as sf
 from whistle_house.audio.io import resample, to_mono_float
 from whistle_house.data.augment import (
     AUDIO_EXTS,
+    active_level_db,
     envelope_clip,
     fit_length,
     mix_at_snr,
+    random_channel,
     random_eq,
     random_gain,
     random_reverb,
     reverse_clip,
     rms,
+    room_reverb,
     saturate,
     splice_notes,
+    synth_background,
     synth_hum,
     synth_pseudo_speech,
     synth_whistle,
@@ -63,6 +78,7 @@ from whistle_house.data.store import NEGATIVE_LABELS, RecordingStore
 from whistle_house.noise_profiles import filter_profiles
 from whistle_house.pipeline import Frontend
 from whistle_house.stages.base import StageContext, build_stage
+from whistle_house.stages.filters.spectral_gate import SpectralGate
 from whistle_house.threads import limit_worker_threads
 from whistle_house.types import WhistleEvent
 
@@ -85,6 +101,16 @@ class GeneratorConfig:
     warmup_s: float = 1.0  # discarded lead-in so stateful filters (noise floor) are settled
     # What the model is trained to detect: one f0 label column per class, in this order.
     classes: tuple[str, ...] = ("whistle",)
+    # Presence-only outputs (AUX_CLASSES: "speech"): one more label column each, after the f0
+    # columns, holding 1 / 0 / -1 (= ignore) per frame. () = none, the labels are f0 only.
+    aux: tuple[str, ...] = ()
+    # Speech labels: a speech source counts where it is within ``speech_range_db`` of its own
+    # loud parts (pauses shorter than ``speech_bridge_s`` are speech too). It is labelled when
+    # its loud parts are no more than ``speech_audible_db[0]`` dB under the rest of the mix,
+    # ignored down to ``[1]``, and below that the frames count as "no speech".
+    speech_range_db: float = 30.0
+    speech_bridge_s: float = 0.3
+    speech_audible_db: tuple[float, float] = (10.0, 20.0)
     # Probability that an example's clean signal is a whistle from each source; the remainder
     # is "no whistle". Unavailable sources hand their share to synthetic whistles.
     p_mic_whistle: float = 0.45
@@ -130,6 +156,46 @@ class GeneratorConfig:
     # soft-clipping the clean signal (whatever it is) as an overdriven mic would.
     p_whistle_overtones: float = 0.5
     p_saturate: float = 0.25
+    # --- Channel and room (all off by default = the first recipe; see AUGMENT_PRESETS). ---
+    # Without these the class could be read off things that have nothing to do with the sound:
+    # hums were reverberated and speech never was, a lone interferer was up to 30 dB quieter
+    # than a positive, and the spectral balance of each class was whatever its dataset's
+    # microphones gave it. On another microphone those cues are simply wrong.
+    # Random frequency response (augment.random_channel) on the clean signal and on each
+    # interferer, drawn independently, and with half this probability on the whole mix.
+    p_channel: float = 0.0
+    # Reverb on the interferer too (the clean signal has p_reverb). With ``room_reverb`` both
+    # use augment.room_reverb (near to far) instead of the nearly direct-less random_reverb.
+    p_reverb_interferer: float = 0.0
+    room_reverb: bool = False
+    # A second interferer under the first, this much quieter (dB): speech in a noisy room.
+    p_second_interferer: float = 0.0
+    second_interferer_db: tuple[float, float] = (-25.0, 0.0)
+    # Level of the loud parts of every example (dBFS, augment.active_level_db), whatever is in
+    # it, instead of the +-gain around each source's own level. None = the old gain.
+    level_dbfs: tuple[float, float] | None = None
+    # --- Steady background and the noise gate (off by default; the ``*-gate`` presets). ---
+    # A room is never silent: mains hum, a fan, a fridge. With this probability an example
+    # gets a steady background under it (a `silence` take from the mic when there are any,
+    # else augment.synth_background: coloured noise + steady tones) at an RMS level drawn
+    # from ``background_dbfs`` and at least 10 dB under the example's loud parts. Ungated, the
+    # model has to learn that a tone which never moves is not a hum.
+    p_background: float = 0.0
+    background_dbfs: tuple[float, float] = (-85.0, -45.0)
+    # With this probability the example's frames go through a spectral gate whose noise
+    # profile was measured on ``gate_profile_s`` of the same background (floor noise
+    # included), as `spectral_gate` / `adaptive_gate` do with a profile of the room. So one
+    # model works with and without a gate in its pipeline. The profile is off by a random
+    # ``gate_offset_db`` (std, dB: gain drift since it was measured), and with
+    # ``p_gate_mismatch`` it was measured with the background ``gate_mismatch_db`` quieter
+    # than it is now, so part of it leaks through: no profile fits the room exactly.
+    # Needs ``level_dbfs`` (the room recipes) and a front end without filters.
+    p_gate: float = 0.0
+    gate_profile_s: float = 3.0
+    gate_offset_db: float = 1.5
+    p_gate_mismatch: float = 0.15
+    gate_mismatch_db: tuple[float, float] = (6.0, 20.0)
+    gate_n_std: tuple[float, float] = (1.5, 3.0)  # the gate's threshold, drawn per example
     # Drop external positives whose auto-labels cover less of the clip (failed/noisy tracking).
     min_voiced_fraction: float = 0.2
     # peak_tracker params for auto-labelling. Stricter than live detection: on synthetic tests
@@ -153,12 +219,21 @@ class GeneratorConfig:
 
     def __post_init__(self) -> None:
         self.classes = tuple(self.classes)
+        self.aux = tuple(self.aux)
+        self.speech_audible_db = tuple(self.speech_audible_db)  # type: ignore[assignment]
+        if set(self.aux) - set(AUX_CLASSES) or len(set(self.aux)) != len(self.aux):
+            raise ValueError(f"aux must be chosen from {AUX_CLASSES}, got {self.aux}")
+        if self.level_dbfs is not None:
+            self.level_dbfs = tuple(self.level_dbfs)  # type: ignore[assignment]
+        elif self.p_background > 0 or self.p_gate > 0:
+            raise ValueError("p_background / p_gate need level_dbfs (use a room augment)")
         unknown = set(self.classes) - set(CLASSES)
         if unknown or not self.classes:
             raise ValueError(f"classes must be chosen from {CLASSES}, got {self.classes}")
 
 
 CLASSES = ("whistle", "hum")  # sounds a detector can be trained on
+AUX_CLASSES = ("speech",)  # presence-only outputs (no pitch): see GeneratorConfig.aux
 
 MIX_PRESETS: dict[str, dict] = {
     # only this mic + synthetic (no external data needed)
@@ -206,13 +281,62 @@ HUM_MIX_PRESETS: dict[str, dict] = {
 }
 
 
+# How sources are put through a channel and a room, laid over any mix (``--augment``).
+#   v1       the first recipe: reverb on the clean signal only, mild EQ on the mix.
+#   channel  v1 + a random frequency response per source (ablation: the response alone).
+#   room     everything: response per source, the same room reverb on clean signal and
+#            interferers, noise under speech, one level distribution for every example, and
+#            more speech among the interferers (it is the failure that matters).
+#   room-mic room, with the deployment mic's own negatives drawn three times as often (as
+#            often as all external speech). For the fine-tune, once there are minutes of
+#            speech from the room: external speech does not sound like the owner there.
+_SPEECH_HEAVY = {
+    "mic": 3.0,
+    "speech": 6.0,
+    "hum": 2.0,
+    "noise": 2.0,
+    "music": 1.0,
+    "noise_dir": 1.0,
+    "synthetic": 1.0,
+}
+AUGMENT_PRESETS: dict[str, dict] = {
+    "v1": {},
+    "channel": {"p_channel": 0.8},
+    "room": {
+        "p_channel": 0.8,
+        "room_reverb": True,
+        "p_reverb": 0.5,
+        "p_reverb_interferer": 0.5,
+        "p_second_interferer": 0.4,
+        "level_dbfs": (-65.0, -10.0),
+        "interferer_weights": _SPEECH_HEAVY,
+    },
+}
+AUGMENT_PRESETS["room-mic"] = {
+    **AUGMENT_PRESETS["room"],
+    "interferer_weights": {**_SPEECH_HEAVY, "mic": 9.0},
+}
+#   room-gate / room-mic-gate  the same with a steady room background (mains hum, fan...)
+#            under 60% of the examples, and half of all examples passed through a spectral
+#            gate with a profile of their background: a model that can sit behind
+#            `spectral_gate` / `adaptive_gate` or behind no filter at all.
+_GATE = {"p_background": 0.6, "p_gate": 0.5}
+AUGMENT_PRESETS["room-gate"] = {**AUGMENT_PRESETS["room"], **_GATE}
+AUGMENT_PRESETS["room-mic-gate"] = {**AUGMENT_PRESETS["room-mic"], **_GATE}
+
+
 def config_for_mix(
-    mix: str, classes: tuple[str, ...] = ("whistle",), **overrides
+    mix: str, classes: tuple[str, ...] = ("whistle",), augment: str = "v1", **overrides
 ) -> GeneratorConfig:
     if mix not in MIX_PRESETS:
         raise KeyError(f"unknown mix {mix!r}; choose from {list(MIX_PRESETS)}")
+    if augment not in AUGMENT_PRESETS:
+        raise KeyError(f"unknown augment {augment!r}; choose from {list(AUGMENT_PRESETS)}")
     hum = HUM_MIX_PRESETS[mix] if "hum" in classes else {}
-    return GeneratorConfig(**{**MIX_PRESETS[mix], **hum, "classes": tuple(classes), **overrides})
+    aug = {k: (dict(v) if isinstance(v, dict) else v) for k, v in AUGMENT_PRESETS[augment].items()}
+    return GeneratorConfig(
+        **{**MIX_PRESETS[mix], **hum, **aug, "classes": tuple(classes), **overrides}
+    )
 
 
 # --------------------------------------------------------------------------- sources
@@ -234,6 +358,11 @@ class TrainingSources:
     mic_hums: list[PositiveClip] = field(default_factory=list)  # only when training "hum"
     ext_hums: list[PositiveClip] = field(default_factory=list)
     interferers: dict[str, list[str]] = field(default_factory=dict)  # group -> file paths
+    # which interferer files are speech (mic ``speech`` clips, external ``speech`` entries):
+    # the source of the ``speech`` aux labels
+    speech_files: frozenset[str] = frozenset()
+    # mic ``silence`` takes: the room's steady backgrounds (GeneratorConfig.p_background)
+    backgrounds: list[str] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {
@@ -242,6 +371,8 @@ class TrainingSources:
             "mic_hum_clips": len(self.mic_hums),
             "external_hum_clips": len(self.ext_hums),
             **{f"interferers_{k}": len(v) for k, v in self.interferers.items()},
+            "speech_files": len(self.speech_files),
+            "background_clips": len(self.backgrounds),
         }
 
     def has_positives(self) -> bool:
@@ -373,6 +504,7 @@ def collect_sources(
     cfg = config or GeneratorConfig()
     fh = frontend_hash(frontend_spec, cfg.labeler_params, data_dir)
     src = TrainingSources()
+    speech_files: set[str] = set()
     hum_class = "hum" in cfg.classes  # hums are positives (pYIN-labelled), not interferers
     hum_cfg = HumLabelConfig()
 
@@ -402,6 +534,10 @@ def collect_sources(
                 src.interferers.setdefault("hum", []).append(path)
             elif rec.label in NEGATIVE_LABELS:
                 mic_neg.append(path)
+                if rec.label == "speech":
+                    speech_files.add(path)
+                elif rec.label == "silence":
+                    src.backgrounds.append(path)
         if pos_items:
             cache = LabelCache(label_cache_dir or Path("."), "mic", fh)
             labels = cache.ensure(pos_items, frontend_spec, cfg.labeler_params, workers, data_dir)
@@ -446,6 +582,8 @@ def collect_sources(
             for e in entries:
                 if e.label not in POSITIVE_LABELS and not (hum_class and e.label == "hum"):
                     src.interferers.setdefault(e.label, []).append(str(ds.prepared_dir / e.path))
+                    if e.label == "speech":
+                        speech_files.add(str(ds.prepared_dir / e.path))
 
     files = [
         str(p)
@@ -456,6 +594,7 @@ def collect_sources(
     ]
     if files:
         src.interferers["noise_dir"] = files
+    src.speech_files = frozenset(speech_files)
     return src
 
 
@@ -489,6 +628,59 @@ class _ClipCache:
         return x
 
 
+# --------------------------------------------------------------------------- speech labels
+
+SPEECH_FRAME_S = 0.02  # resolution of the speech activity labels
+# A segment of a speech file quieter than this (dBFS, loud parts, as recorded) is a pause or
+# room tone, not speech: its frames are ignored rather than labelled either way.
+SPEECH_MIN_LEVEL_DB = -60.0
+
+
+def _frame_db(x: np.ndarray, hop: int) -> np.ndarray:
+    m = len(x) // hop
+    e = np.mean(np.square(x[: m * hop].reshape(m, hop), dtype=np.float64), axis=1)
+    return 10 * np.log10(e + 1e-14)
+
+
+def speech_activity(
+    x: np.ndarray, sr: int, range_db: float = 30.0, bridge_s: float = 0.3
+) -> np.ndarray:
+    """Where a speech signal is sounding: bool per ``SPEECH_FRAME_S`` frame.
+
+    A frame is active when its level is within ``range_db`` of the signal's loud parts (95th
+    percentile of the frame levels); gaps shorter than ``bridge_s`` between active frames
+    (stop consonants, the breath between words) are filled, longer pauses are not speech."""
+    db = _frame_db(x, max(1, int(SPEECH_FRAME_S * sr)))
+    if not len(db):
+        return np.zeros(0, bool)
+    on = db >= np.percentile(db, 95) - range_db
+    idx = np.flatnonzero(on)
+    for a, b in itertools.pairwise(idx):
+        if 1 < b - a <= round(bridge_s / SPEECH_FRAME_S):
+            on[a:b] = True
+    return on
+
+
+def speech_labels(
+    speech: np.ndarray, rest: np.ndarray, sr: int, cfg: GeneratorConfig
+) -> np.ndarray:
+    """Per-``SPEECH_FRAME_S``-frame speech target for a mix of ``speech`` + ``rest``:
+    1 = speech sounding, 0 = not, -1 = ignore (see ``GeneratorConfig.speech_audible_db``)."""
+    hop = max(1, int(SPEECH_FRAME_S * sr))
+    on = speech_activity(speech, sr, cfg.speech_range_db, cfg.speech_bridge_s)
+    y = np.zeros(len(on), np.float32)
+    if not on.any():
+        return y
+    loud = float(np.percentile(_frame_db(speech, hop), 95))
+    under = float(np.percentile(_frame_db(rest, hop), 95)) - loud  # dB the speech is under
+    label, ignore = cfg.speech_audible_db
+    if under <= label:
+        y[on] = 1.0
+    elif under <= ignore:
+        y[on] = -1.0
+    return y
+
+
 # --------------------------------------------------------------------------- generator
 
 
@@ -504,6 +696,11 @@ class ExampleGenerator:
         self.frontend = Frontend.from_dict(frontend_spec, data_dir)
         self.sr = self.frontend.sample_rate
         self.sources = sources
+        if self.cfg.p_gate > 0 and self.frontend.filters:
+            raise ValueError(
+                "gated examples are made by the generator: train on the pipeline without its "
+                "filters, then put the gate in the pipeline that uses the model"
+            )
         self._clips = _ClipCache(self.sr)
         n_mic = len(sources.interferers.get("mic", []))
         mic_scale = min(1.0, n_mic / max(1, self.cfg.mic_full_weight_clips))
@@ -564,22 +761,100 @@ class ExampleGenerator:
         f0 = np.where((t >= 0) & (t < L / self.sr), f0_full[idx], 0).astype(np.float32)
         return clean, f0
 
-    def _interferer(self, n: int, rng) -> np.ndarray:
+    def _interferer(self, n: int, rng) -> tuple[np.ndarray, bool | None]:
+        """(audio, is it speech). None = can't say: synthetic pseudo-speech (speech-shaped on
+        purpose, but not speech), or a stretch of a speech file with nobody talking."""
         if not self._groups:
-            return synth_pseudo_speech(self.sr, n / self.sr, rng)
+            return synth_pseudo_speech(self.sr, n / self.sr, rng), None
         g = self._groups[int(rng.choice(len(self._groups), p=self._group_p))]
         if g == "synthetic":
-            return synth_pseudo_speech(self.sr, n / self.sr, rng)
+            return synth_pseudo_speech(self.sr, n / self.sr, rng), None
         files = self.sources.interferers[g]
         for _ in range(3):
+            path = files[int(rng.integers(len(files)))]
             try:
-                x = read_segment(files[int(rng.integers(len(files)))], n, self.sr, rng)
+                x = read_segment(path, n, self.sr, rng)
             except Exception as e:  # noqa: BLE001 - one bad file must not stop training
                 log.warning("bad interferer file: %s", e)
                 continue
             if rms(x) > 1e-5:
-                return x
-        return synth_pseudo_speech(self.sr, n / self.sr, rng)
+                if path not in self.sources.speech_files:
+                    return x, False
+                return x, (True if active_level_db(x, self.sr) >= SPEECH_MIN_LEVEL_DB else None)
+        return synth_pseudo_speech(self.sr, n / self.sr, rng), None
+
+    def _room_interferer(self, n: int, rng) -> tuple[np.ndarray, np.ndarray | None, bool]:
+        """An interferer as it would reach the mic: optionally with a second, quieter one under
+        it, reverberated and coloured like any other source (all off unless configured).
+
+        Returns (audio, the part of it that is speech or None, whether some part may or may not
+        be speech). The speech part is what the ``speech`` labels are made from."""
+        c, sr = self.cfg, self.sr
+
+        def one() -> tuple[np.ndarray, bool | None]:
+            x, is_speech = self._interferer(n, rng)
+            if c.p_reverb_interferer > 0 and rng.random() < c.p_reverb_interferer:
+                x = (room_reverb if c.room_reverb else random_reverb)(x, sr, rng)
+            if c.p_channel > 0 and rng.random() < c.p_channel:
+                x = random_channel(x, sr, rng)
+            return x, is_speech
+
+        noise, is_speech = one()
+        speech = noise if is_speech else None
+        unsure = is_speech is None
+        if c.p_second_interferer > 0 and rng.random() < c.p_second_interferer:
+            other, is_speech = one()
+            gain = 10 ** (rng.uniform(*c.second_interferer_db) / 20)
+            other = other * gain * rms(noise) / rms(other)
+            noise = noise + other
+            if is_speech:
+                speech = other if speech is None else speech + other
+            unsure = unsure or is_speech is None
+        return (
+            noise.astype(np.float32),
+            None if speech is None else speech.astype(np.float32),
+            unsure,
+        )
+
+    def _steady(self, m: int, floor_db: float, level_db: float, rng) -> np.ndarray:
+        """The steady part of the room for ``m`` samples, as (2, m): the mic's own noise at
+        ``floor_db`` and, with ``p_background``, a room background (zeros without one)."""
+        c, sr = self.cfg, self.sr
+        out = np.zeros((2, m), np.float32)
+        out[0] = 10 ** (floor_db / 20) * rng.standard_normal(m)
+        if rng.random() < c.p_background:
+            bg = None
+            files = self.sources.backgrounds
+            if files and rng.random() < 0.5:
+                try:
+                    bg = read_segment(files[int(rng.integers(len(files)))], m, sr, rng)
+                except Exception as e:  # noqa: BLE001 - one bad file must not stop training
+                    log.warning("bad background file: %s", e)
+            if bg is None or rms(bg) < 1e-6:
+                bg = synth_background(sr, m, rng)
+            lo, hi = c.background_dbfs
+            db = rng.uniform(lo, max(lo, min(hi, level_db - 10.0)))
+            out[1] = bg * 10 ** (db / 20) / rms(bg)
+        return out
+
+    def _gate(self, block, steady: np.ndarray, rng) -> np.ndarray:
+        """``block`` through a spectral gate whose profile is measured on ``steady`` (the
+        stretch of the example's floor noise and background just before it)."""
+        c = self.cfg
+        floor, bg = steady
+        if bg.any() and rng.random() < c.p_gate_mismatch:
+            bg = bg * 10 ** (-rng.uniform(*c.gate_mismatch_db) / 20)
+        _, prof = self.frontend.process_signal((floor + bg).astype(np.float32))
+        v = prof.values[8:]  # the first frames still hold the transform's start-up
+        gate = SpectralGate(
+            SpectralGate.Config(n_std=float(rng.uniform(*c.gate_n_std))),
+            StageContext(self.sr, axis=block.axis),
+        )
+        gate.set_profile(
+            v.mean(axis=0) + rng.normal(0.0, c.gate_offset_db), np.maximum(v.std(axis=0), 0.5)
+        )
+        with np.errstate(over="ignore"):  # exp() of a bin far under the threshold: mask 0
+            return gate.process(block).values
 
     def _clean(self, n: int, rng: np.random.Generator) -> tuple[str | None, np.ndarray, np.ndarray]:
         """Pick the example's clean signal: (class or None, audio (n,), per-sample f0 (n,))."""
@@ -620,33 +895,73 @@ class ExampleGenerator:
         return None, np.zeros(n, np.float32), np.zeros(n, np.float32)
 
     def example(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-        """(features (T, F), f0 (T, K)): one f0 column per class in ``cfg.classes``."""
+        """(features (T, F), labels (T, K + A)): one f0 column per class in ``cfg.classes``,
+        then one presence column (1 / 0 / -1 = ignore) per name in ``cfg.aux``."""
         c, sr = self.cfg, self.sr
         n = int((c.window_s + c.warmup_s) * sr)
         kind, clean, f0 = self._clean(n, rng)
 
+        reverb = room_reverb if c.room_reverb else random_reverb
         if c.p_saturate > 0 and clean.any() and rng.random() < c.p_saturate:
             clean = saturate(clean, rng)
         if rng.random() < c.p_reverb and clean.any():
-            clean = random_reverb(clean, sr, rng)
+            clean = reverb(clean, sr, rng)
+        if c.p_channel > 0 and rng.random() < c.p_channel:
+            clean = random_channel(clean, sr, rng)
         has_signal = rms(clean) > 1e-4
+        speech_y = None  # per SPEECH_FRAME_S frame; None = no speech anywhere in the example
+        steady, n_prof = None, 0  # floor noise + room background (the *-gate recipes)
         if rng.random() < c.p_interferer or not has_signal:
-            noise = random_gain(self._interferer(n, rng), rng, -30, 0)
+            raw, speech, unsure = self._room_interferer(n, rng)
+            noise = random_gain(raw, rng, -30, 0)
             mix = mix_at_snr(clean, noise, rng.uniform(*c.snr_db)) if has_signal else noise
+            if "speech" in c.aux and unsure:
+                speech_y = np.full(n // max(1, int(SPEECH_FRAME_S * sr)), -1.0, np.float32)
+            elif "speech" in c.aux and speech is not None:
+                # the interferer was scaled as a whole (gain, then to the SNR): by how much?
+                in_mix = (mix - clean) if has_signal else mix
+                k = float(np.dot(in_mix, raw) / max(float(np.dot(raw, raw)), 1e-20))
+                speech_y = speech_labels(k * speech, mix - k * speech, sr, c)
         else:
             mix = clean
-        mix = mix + 10 ** rng.uniform(-5, -3) * rng.standard_normal(n).astype(np.float32)
+        if c.level_dbfs is None:
+            mix = mix + 10 ** rng.uniform(-5, -3) * rng.standard_normal(n).astype(np.float32)
         if rng.random() < c.p_eq:
             mix = random_eq(mix, sr, rng)
-        mix = np.clip(random_gain(mix, rng, -12, 6), -1, 1).astype(np.float32)
+        if c.p_channel > 0 and rng.random() < 0.5 * c.p_channel:
+            mix = random_channel(mix, sr, rng)  # the microphone: the same for every source
+        if c.level_dbfs is None:
+            mix = np.clip(random_gain(mix, rng, -12, 6), -1, 1).astype(np.float32)
+        else:
+            # One level distribution whatever the example holds, then the mic's own noise:
+            # at least 20 dB under the loud parts, so a labelled sound is never buried in it.
+            level = rng.uniform(*c.level_dbfs)
+            mix = mix * 10 ** ((level - active_level_db(mix, sr)) / 20)
+            floor = rng.uniform(-95.0, min(-60.0, level - 20.0))
+            if c.p_background > 0 or c.p_gate > 0:
+                # the room's steady part, with a stretch before the example for the profile
+                n_prof = int(c.gate_profile_s * sr)
+                steady = self._steady(n_prof + n, floor, level, rng)
+                mix = mix + steady[:, n_prof:].sum(axis=0)
+            else:
+                mix = mix + 10 ** (floor / 20) * rng.standard_normal(n)
+            mix = np.clip(mix, -1, 1).astype(np.float32)
 
         _, block = self.frontend.process_signal(mix)
+        values = block.values
+        if steady is not None and rng.random() < c.p_gate:
+            values = self._gate(block, steady[:, :n_prof], rng)
         keep = block.times >= c.warmup_s
         idx = np.clip(np.round(block.times[keep] * sr).astype(int), 0, n - 1)
-        y = np.zeros((len(idx), len(c.classes)), np.float32)
+        y = np.zeros((len(idx), len(c.classes) + len(c.aux)), np.float32)
         if kind is not None:
             y[:, c.classes.index(kind)] = f0[idx]
-        return block.values[keep], y
+        if speech_y is not None:
+            hop = max(1, int(SPEECH_FRAME_S * sr))
+            y[:, len(c.classes) + c.aux.index("speech")] = speech_y[
+                np.clip(idx // hop, 0, len(speech_y) - 1)
+            ]
+        return values[keep], y
 
     def batch(self, rng: np.random.Generator, size: int) -> tuple[np.ndarray, np.ndarray]:
         xs, ys = zip(*(self.example(rng) for _ in range(size)), strict=True)

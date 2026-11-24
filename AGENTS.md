@@ -46,7 +46,8 @@ AGENTS.md            this file (CLAUDE.md just imports it)
 scripts/train-forever.sh  rerun a training command with --resume until it finishes
 deploy/whistle-house.service  systemd unit that runs `serve` on the Pi (see "Running the server")
 notebook/            lab notebook: one dated markdown file per training run / experiment
-                     (machine, command, trade-offs, results); committed
+                     (machine, command, trade-offs, results); committed. scripts/<date>-<topic>/
+                     holds the one-off measurement scripts an entry's numbers came from
 pyproject.toml       python package (uv). extras: ml (torch), wandb (training machine only).
                      dev group: pytest, ruff, librosa
 mise.toml            node version for the manager (managed by mise)
@@ -67,14 +68,17 @@ src/whistle_house/
     transforms/stft.py   StreamingSTFT core + stft_mel (v1 port) + stft_linear + stft_log
                          (60 Hz-4 kHz, 24 bins/octave, n_fft 4096: covers hums and whistles)
     filters/basic.py     identity, noise_floor, frame_median, band_reject
-    filters/spectral_gate.py  gate against a measured noise profile (needs a silence recording)
+    filters/spectral_gate.py  gate against a measured noise profile (needs a silence recording;
+                              `set_profile` = statistics given directly, used by training)
     filters/adaptive_gate.py  several profiles (quiet, fridge, fan...): a Bayes filter tracks
                               which one is on per frame and gates with it (see "Adaptive gate")
     detectors/common.py  ContourTracker (links per-frame pitch candidates into notes),
                          drop_harmonics (which peaks of a frame are overtones)
     detectors/peak_tracker.py  heuristic baseline (also auto-labels clean whistle pitch)
     detectors/learned.py       WhistleNet-backed detector (torch, lazy import): one tracker per
-                               kind the checkpoint detects (whistle, hum), true streaming
+                               kind the checkpoint detects (whistle, hum), true streaming;
+                               `speech_hold_s`: hums held back while / after speech (needs a
+                               checkpoint with a speech output)
     recognizers/score_align.py    tunes written as sheet music: aligns the score to the pitch
                                   curve, free in key and tempo (see "Tunes" below)
     recognizers/note_template.py  per-note template fitted from examples (one event per note)
@@ -83,16 +87,22 @@ src/whistle_house/
                      render.py (filtered frames -> audio: the "Processed" playback in the manager)
   data/
     store.py         recordings: data/recordings/<id>.wav + <id>.json (label, tune, segments, split)
-    augment.py       mix_at_snr, gain/EQ/reverb/saturate, synth_whistle, synth_hum, synth_pseudo_speech,
+    augment.py       mix_at_snr, gain/EQ/reverb/saturate, random_channel + room_reverb (the `room`
+                     recipe), synth_background (steady room noise + mains hum / fan tones, the
+                     `*-gate` recipes), synth_whistle, synth_hum, synth_pseudo_speech,
                      labelled-clip augmentation (splice_notes, warp_clip, reverse/envelope)
     perform.py       simulated performances of a Score (key, tempo, slides, sloppiness) as a
                      pitch curve -> events through the real ContourTracker; for recognizer tests
     training.py      collect_sources (+ LabelCache pitch auto-labels), ExampleGenerator (one f0
-                     label column per class), MIX_PRESETS / HUM_MIX_PRESETS
+                     label column per class), MIX_PRESETS / HUM_MIX_PRESETS (what is in an
+                     example), AUGMENT_PRESETS (the channel and room it goes through; the
+                     `*-gate` ones also gate half of the examples, see "Gated examples"),
+                     speech_labels (frame labels for the presence-only `speech` output)
     hum_labels.py    pYIN hum pitch labels (offline, librosa), harmonic-level profile
   external/          external datasets: base.py (download/prepare/manifest framework),
                      datasets.py (mlend_whistles, mlend_hums, musan, esc50, demand)
-  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep/harmonic_long),
+  ml/                model.py (WhistleNet, causal CNN; HarmonicStack input; ARCHS small/large/harmonic/harmonic_deep/harmonic_long;
+                     `aux` = presence-only outputs such as speech, `add_aux` puts one on an old checkpoint),
                      train.py (training loop, per-class metrics, status json, resume state),
                      tracking.py (optional Weights & Biases logging),
                      export.py (ONNX export of a checkpoint + OnnxStream, the torch-free
@@ -118,7 +128,9 @@ tests/               pytest: transform parity (v1 + librosa), pipeline, tunes, n
                      overtone rejection (test_overtones.py), written tunes against simulated
                      performances (test_score_align.py), model report (test_inspect.py),
                      ONNX export == torch + thread limit (test_onnx.py),
-                     mic watchdog (test_engine_watchdog.py), adaptive_gate (test_adaptive_gate.py)
+                     mic watchdog (test_engine_watchdog.py), adaptive_gate (test_adaptive_gate.py),
+                     speech output + speech hold (test_speech_head.py),
+                     room backgrounds + gated training examples (test_gate_augment.py)
 .env.example         settings template; copy to .env (gitignored)
 data/                runtime data, gitignored (recordings, models, tunes, outputs, pipelines,
                      reports/<model>/ = model reports)
@@ -141,6 +153,14 @@ uv run whistle-house analyze clip.wav --pipeline default
 uv run whistle-house import *.wav --label speech       # bulk-add to the dataset
 uv run whistle-house train-detector --name whistlenet --device auto
 uv run whistle-house train-detector --pipeline hum-log --arch harmonic --name humnet  # + hums
+uv run whistle-house train-detector ... --augment room   # channel + room simulation: use it for
+                                               # any model that must reject speech (see below)
+uv run whistle-house train-detector --mix finetune --augment room-mic --keep last --patience 0 \
+  --epochs 20 --steps-per-epoch 100 --init-from <pretrain> ...   # the mic fine-tune
+uv run whistle-house train-detector ... --augment room-gate   # (fine-tune: room-mic-gate) for
+                                               # a model used behind spectral_gate / adaptive_gate
+uv run whistle-house train-detector ... --aux speech   # + a speech output (presence only); the
+                                               # learned detector's speech_hold_s uses it
 uv run whistle-house train-detector ... --resume   # same command again: continue a crashed run
 uv run whistle-house train-detector ... --wandb-project whistle-house   # + Weights & Biases
 uv run whistle-house datasets list             # external datasets + status
@@ -153,6 +173,10 @@ uv run whistle-house inspect-model humnet      # -> data/reports/humnet/index.ht
                                                # ~1.7 GB peak; Models page: "Build report")
 uv run whistle-house export-onnx humnet        # -> data/models/humnet.onnx, checked against
                                                # torch (or 'all'; Models page: "Export ONNX")
+
+# On a machine synced with extras (`--extra ml`, `--extra onnx`), a bare `uv run` can re-sync the
+# venv without them and remove torch (seen on lgn9 and dirk). Use `.venv/bin/whistle-house` /
+# `.venv/bin/python` there, or `uv run --extra ml ...`.
 
 # manager (node via mise: `mise install` once; prefix with `mise exec --` if mise isn't activated)
 cd manager && npm install
@@ -374,6 +398,76 @@ with different flags than it had (look at the pane for the last command line).
   random SNR (−3…25 dB), plus random gain, EQ and reverb. Interferers come from negative
   recordings on this mic, files in `data/noise/**`, and `synth_pseudo_speech` (harmonic stacks
   with moving formants, the spectral shape that fooled v1).
+* **Channel and room: `--augment room`** (`AUGMENT_PRESETS`, laid over any mix; notebook
+  2026-11-23). The first recipe (`v1`, still the default so old runs can be repeated) let a
+  model read the class off things that are not the sound: reverb was only ever applied to
+  the whistle / hum, a lone interferer was 0-30 dB quieter than an example with a positive,
+  and each class had the spectral balance of its dataset's microphones. Every `v1` model
+  (`harmonic`, `_deep`, `_long`) learned to tell a hum from speech mostly by how much energy
+  sits above the fundamental. On the Fifine in the owner's room, 280 Hz-3 kHz arrives 13-18 dB
+  weaker relative to the voice's fundamental than on the Mac mic, so his speech there has the
+  harmonic roll-off of a training hum (h2 -9, h3 -14, h4 -25 dB; MLEnd hums -8, -15, -23) and
+  10-22% of its frames were called hum (MUSAN speech: 0.3-0.5%). Applying that response to
+  his Mac-mic speech took it from 0.07% to 36%; removing it from the Fifine speech, 10% to 0%.
+  `room` makes those cues useless: a random smooth frequency response per source and on the
+  mix (`random_channel`: tilt, shelves up to 20 dB, bumps), the same `room_reverb` (near to
+  far) on positives and interferers, a second interferer under the first, one loudness range
+  for every example, and twice the speech among the interferers. `room-mic` is `room` with
+  the deployment mic's negatives drawn 3x as often (for the fine-tune). `channel` is the ablation
+  with only the per-source response (unstable from checkpoint to checkpoint and it costs hum
+  recall: use `room`). Validation sets use the same augment, so val numbers of `v1` and `room`
+  runs are not comparable: compare on recordings. Result, same arch and settings, no Fifine
+  clip seen in training: his Fifine speech called hum 21.6% -> 0.9% of frames, flat from
+  -12 to +24 dB of gain (v1: 6% -> 34%), with more of his hums (90% -> 94% of voiced frames)
+  and whistles (53% -> 73% of frames) found, and MUSAN speech 0.33% -> 0.16%.
+* **Gated examples: `--augment room-gate` / `room-mic-gate`** (notebook
+  `2026-11-24-gated-examples.md`). For a model whose pipeline has a `spectral_gate` or
+  `adaptive_gate` (a steady 120 Hz mains hum on the Fifine was drawn as a hum note by
+  `humnet-long-room2`; the gate removes it). `room` / `room-mic` plus: a steady room
+  background under 60% of the examples (`p_background`: a mic `silence` take half the time
+  when there are any, else `augment.synth_background` = coloured noise + steady tones, many
+  on the mains), and half of all examples passed through `SpectralGate` with a profile
+  measured on the 3 s of floor noise + background before the example (`p_gate`; the profile
+  is off by a random gain, 15% of the time measured with the background 6-20 dB quieter so
+  some leaks, and `n_std` is drawn from 1.5-3). **Train on the pipeline without filters**
+  (the generator refuses a front end with filters when `p_gate` > 0); the gate goes in the
+  pipeline that uses the model, and the same model also works ungated. Old recipes are
+  bit-identical. A gated epoch costs about a third more data-loading time. First models
+  (gated examples in the mic fine-tune only, `humnet-long-gate-ft`; `-nohum` = without the
+  clips that have the hum): behind the six-profile `adaptive_gate` they keep 57% of the
+  Fifine whistle frames, the same as ungated, where models trained without gated frames
+  drop to 38-47%; hums 91-94% of voiced frames either way; speech called hum 0.5-0.6% of
+  frames behind the gate (others 0.7%), none with a 1 s speech hold. The gate takes the
+  120 Hz hum out for every model, even without a profile of it. Ungated, the model that
+  never saw the hum clips calls 2.3% of their frames a hum (`humnet-long-room2-sp`: 92%),
+  and any model fine-tuned with those clips as negatives ignores it: a `silence` take of a
+  new steady noise is both a gate profile (works at once) and a negative for the next
+  fine-tune. Gated examples from the start (`humnet-long-gate-pretrain` ->
+  `humnet-long-gate`, 131 min instead of 31) gave no clear gain: slightly more whistle
+  frames behind the gate (60% against 57%), but a less sure speech output on the owner's
+  speech (78% of frames against 88%, so a 1 s hold leaves one hum event in 6.5 min where
+  `-ft` leaves none) and twice the whistle events on MUSAN noise. `humnet-long-gate-ft` is
+  the one to try. That pretrain, which never heard the Fifine or the hum, calls 0% of the
+  hum clips' frames a hum without a gate: steady backgrounds from the start make a model
+  ignore such a tone. `humnet-long-gate-ft` behind the gate (the owner's seven profiles,
+  1 s speech hold) is dirk's active pipeline since 2026-11-24 08:07; cost in "Inference on
+  the Pi". Checked there on recordings only, not yet in a conversation or with the hum on.
+* **Speech output: `--aux speech`** (notebook `2026-11-23-speech-head.md`). A presence-only
+  head ("is someone talking in this frame?", no pitch) next to the whistle / hum ones, so the
+  detector can hold hums back around speech (`speech_hold_s`, see "Inference on the Pi")
+  instead of having to call every hum-like syllable correctly on its own. Labels come from
+  the speech interferers (`speech_labels` in `data/training.py`): mic `speech` clips and
+  external `speech` entries are followed through reverb, channel and mixing; frames within
+  30 dB of the speech's loud parts are 1 (gaps under 0.3 s filled) when the speech is no more
+  than 10 dB under the rest of the mix, -1 = left out of the loss when 10-20 dB under or when
+  the interferer is synthetic pseudo-speech, else 0. The label means "speech is going on"
+  (96% of a speech example), not word timing. The head is one linear layer on the features
+  the presence head reads (`WhistleNetConfig.aux`; its outputs are extra presence columns
+  after the classes); `--aux speech --init-from <checkpoint without one>` adds it
+  (`add_aux`). Metrics: `speech_f1`, `speech_recall`, `speech_false_positive_rate`, outside
+  the mean F1 that picks a checkpoint. Recipes without `--aux` generate exactly the examples
+  they did before. To add another presence-only output: a name in `AUX_CLASSES`, its label
+  column in `ExampleGenerator.example`.
 * **External datasets** (`external/`, see the workflow below) give a warm start: MLEnd whistles
   (positives), MLEnd hums (hard negatives), MUSAN speech/music/noise, ESC-50, DEMAND. Any other
   audio dropped into `data/noise/` is used as extra interferers. Synthetic whistles fill gaps.
@@ -563,8 +657,59 @@ with no tunes) per 4096-sample chunk = 93 ms of audio, synthetic test audio, med
   cleans the spectrum but these models were trained ungated and gain nothing from it on
   speech (it helps the long model on whistles, 85% vs 78%). Live pipeline on dirk:
   `humnet-long-e240` (ungated). 21 s of speech is too little for a rate: record minutes.
-* Not measured yet: `spectral_gate` in the chain, `score_align` with real tunes, the server
-  process as a whole (websocket, encoding for the Live page).
+* **Speech on the Fifine, and `humnet-long-room2`** (2026-11-23, notebook of that date). A
+  conversation fired ~0.7 tunes a minute on `humnet-long-e240-gate`. On 16 speech clips
+  (6.5 min, many manners of speaking) the v1 models call 13-19% of frames hum (the 1.4%
+  above was one quiet clip), twice that behind the `adaptive_gate` (trained ungated), and the
+  recognizer ran at `threshold` 0.1. Cause and fix: "Channel and room" under "Data & training
+  strategy". `humnet-long-room2` = `--augment room` pretrain (60 epochs) + a fine-tune on all
+  Fifine clips (`--augment room-mic --keep last --epochs 20 --steps-per-epoch 100 --patience
+  0`): 0.0% on the five speech clips it never saw (live model 9.7%), 0.27% / 1.2 hum events
+  per minute over all 6.5 min, 95% of voiced hum frames, 9 of 9 hummed tune clips matched.
+  Sing-song speech is the hard kind: on such clips left out of a fine-tune, ~2% of frames
+  (9% without a fine-tune), and "hmm" while thinking is a hum. It was dirk's active pipeline
+  (same name; ungated, threshold 0.5) from 2026-11-23 21:55 until `humnet-long-gate-ft`
+  replaced it on 2026-11-24 (see "Gated examples"); before that the owner had
+  switched hums off on `humnet-long-e240-gate` (`kinds: ["whistle"]`, still so in that
+  pipeline). Not measured: a real conversation.
+* **Speech hold (`speech_hold_s` on the `learned` detector; needs a checkpoint with a speech
+  output).** Once the speech output has been >= `speech_threshold` (0.5) for `speech_min_s`
+  (0.1 s), the kinds in `speech_holds` (hums; whistles are never mistaken for speech) get no
+  pitch candidates until `speech_hold_s` after the last speech frame, and a hum note still
+  sounding when speech is confirmed is dropped. Off by default (0); 1 s is the value tried.
+  The speech score is shown as a dotted trace next to the kinds' (`kind_scores["speech"]`).
+  First models (head added to `humnet-long-room-pretrain` in the mic fine-tune,
+  `humnet-long-room2-sp` and two leave-out folds): the speech output is on for 79-92% of the
+  frames (91-99% of voiced frames) of Fifine speech clips the model never saw, 92% of MUSAN
+  val speech, 0% of whistles and of 20 of the 21 Fifine hum clips, ~1% of MLEnd hums, 4-6% of
+  MUSAN music / noise. With a 1 s hold, hum events on all Fifine speech went 1.2 -> 0 per
+  minute, on left-out hard clips 2.4 -> 0 and 11 -> 3 (what is left: "hmm" with nobody
+  talking, and speech called from another room), on MUSAN speech 0.7 -> 0.07; every hummed
+  tune clip still matched. The cost: a fast hummed melody (notes of 0.2-0.5 s with leaps,
+  clip `fb3c1d2fe46f`) reads as speech about half the time and loses two thirds of its
+  notes. Do not raise `speech_threshold` / `speech_min_s` to fix that: the hum-like stretches
+  of speech are where the speech output is least sure, and they go because confident speech
+  is within the hold of them.
+  Training the head from the start (`humnet-long-speech-pretrain` -> `humnet-long-speech`,
+  100 min instead of 25) gave nothing measurable over adding it in the fine-tune and a hum
+  output a little worse on music; `humnet-long-room2-sp` is the one to try. The pretrain
+  model, which never heard the Fifine, has its speech output on for 77% of the owner's
+  speech there, and a 1 s hold takes its hum events on that speech from 6.1 to 0.8 a
+  minute: the hold does not depend on the mic fine-tune.
+* **Fine-tuning on mic clips: use `--keep last`.** Val F1 is mostly external data, so with
+  the warmstart settings (`--patience 15`, 60 x 50 steps) "best" was an epoch from the LR
+  warm-up that had hardly moved, or the init checkpoint itself, and the run stopped at the
+  LR peak. A schedule that runs to its end with the last epoch kept (above) gave consistent
+  results; `room-mic` draws this mic's negatives 3x as often. Judge it on recordings
+  (`notebook/scripts/2026-11-23-speech-vs-hum/`), leaving some clips out to see what
+  generalises.
+* **`adaptive_gate` + speech head, real tunes, the whole server** (2026-11-24, dirk, 12
+  recordings fed in 4096-sample chunks with the service running beside it, the owner's
+  three tunes in `score_align`): `humnet-long-room2` (no filter) 14.6 ms per chunk median,
+  17.9 at the 95th percentile; `humnet-long-gate-ft` behind a seven-profile `adaptive_gate`
+  with the speech hold 15.8 / 18.5 (worst 32.5), so the gate and the speech output cost
+  about 1 ms per chunk, 17% of a core in all. The `serve` process with that pipeline and
+  one Live page open: 26% of a core over 30 s, 214 MB resident.
 
 ## Model report (`inspect-model`)
 
@@ -592,9 +737,15 @@ stack (~14 dB harmonics over gaps on the frames that fire, vs ~30 dB on hums).
   errors. Speech still fires as hum: on the two held-out speech clips (15 s) 10.1% of frames
   for `humnet`, 5.1% for `humnet-deep`; on train-split speech 1.2% vs 0.3%. Train-split speech
   is also a training interferer (the 23 mic negatives are ~30% of interferer draws, most of
-  them the owner's speech), so only held-out speech counts. Next: record several minutes of
-  held-out speech to measure this properly; train `harmonic_long` (same warm start,
-  `--arch harmonic_long`) and compare its speech-as-hum rate with these two. Open questions: does singing count as a hum
+  them the owner's speech), so only held-out speech counts. That was the Mac mic; on the
+  Fifine all three archs failed alike and the cause was the training recipe, not the context
+  length (`--augment room`, see "Channel and room"). Next: record several minutes of
+  conversation on the Fifine and measure `humnet-long-room2` on it (triggers per hour is the
+  number that matters); evaluate `humnet-long-room-pretrain-e240` (240 epochs, started on
+  lgn9 2026-11-23) and fine-tune it the same way; a mic-negatives probe in `validate()` so a
+  fine-tune's "best" checkpoint means something; retrain the cheaper archs with `room` if the Pi's CPU
+  matters; a set of measured room responses for validation; hums below 100 Hz are found less
+  often (MLEnd has few). Open questions: does singing count as a hum
   (today it is neither class; MUSAN music is an interferer); sustained instrument notes are
   harmonic combs too; re-record hums on the Pi's USB mic.
 

@@ -79,6 +79,9 @@ class TrainBody(BaseModel):
     steps_per_epoch: int = 100
     batch_size: int = 16
     mix: str = "mic"  # mic | pretrain | finetune
+    augment: str = "v1"  # channel / room simulation: an AUGMENT_PRESETS name
+    keep: str = "best"  # which epoch becomes <name>.pt: best (val F1) | last
+    aux: list[str] = Field(default_factory=list)  # presence-only outputs to add: speech
     external: list[str] = Field(default_factory=list)  # external dataset names
     init_from: str | None = None  # model name to fine-tune from
     workers: int = 2
@@ -533,7 +536,7 @@ def create_app(
     @app.get("/api/datasets")
     def datasets():
         """External dataset status. Usually unconfigured on the Pi (fetching happens elsewhere)."""
-        from whistle_house.data.training import MIX_PRESETS
+        from whistle_house.data.training import AUGMENT_PRESETS, MIX_PRESETS
         from whistle_house.external import dataset_status
         from whistle_house.settings import external_root
 
@@ -542,6 +545,7 @@ def create_app(
             "root": str(root) if root else None,
             "datasets": dataset_status(root),
             "mixes": MIX_PRESETS,
+            "augments": AUGMENT_PRESETS,
         }
 
     @app.get("/api/models")
@@ -669,6 +673,10 @@ def create_app(
             str(body.batch_size),
             "--mix",
             body.mix,
+            "--augment",
+            body.augment,
+            "--keep",
+            body.keep,
             "--workers",
             str(body.workers),
             "--val-examples",
@@ -680,6 +688,8 @@ def create_app(
         ]
         if body.external:
             cmd += ["--external", ",".join(body.external)]
+        if body.aux:
+            cmd += ["--aux", ",".join(body.aux)]
         if body.init_from:
             cmd += ["--init-from", body.init_from]
         if body.wandb_project:
@@ -725,6 +735,10 @@ def create_app(
             str(c["seed"]),
             "--mix",
             c["mix"],
+            "--augment",
+            c.get("augment", "v1"),
+            "--keep",
+            c.get("keep", "best"),
             "--workers",
             str(c["workers"]),
             "--val-examples",
@@ -740,6 +754,8 @@ def create_app(
             cmd += ["--classes", ",".join(c["classes"])]
         if c.get("external"):
             cmd += ["--external", ",".join(c["external"])]
+        if c.get("aux"):
+            cmd += ["--aux", ",".join(c["aux"])]
         if c.get("init_from"):
             cmd += ["--init-from", c["init_from"]]
         if c.get("wandb_project"):  # continues the same wandb run

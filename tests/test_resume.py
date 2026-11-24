@@ -115,3 +115,30 @@ def test_wandb_run_is_continued_on_resume(tmp_path, monkeypatch):
     assert status["state"] == "done" and status["wandb"]["id"] == first["id"]
     runs = list((tmp_path / "wandb").glob(f"offline-run-*-{first['id']}"))
     assert len(runs) == 2  # the crashed and the resumed process, one wandb run id
+
+
+def test_keep_last_saves_the_final_epoch_not_the_best(tmp_path):
+    """`--keep last`: <name>.pt holds the weights training ended with (for mic fine-tunes,
+    where val F1 often keeps the init checkpoint)."""
+    paths, _ = _store_with_hums(tmp_path)
+    train(LOG_SPEC, paths, "pre", TrainConfig(**TINY))
+    train(LOG_SPEC, paths, "ft", TrainConfig(**TINY, init_from="pre", mix="finetune", keep="last"))
+    status = json.loads((paths.models / "ft.json").read_text())
+    assert status["kept"] == {"epoch": 3, "which": "last"}
+    kept = torch.load(paths.models / "ft.pt", weights_only=False)
+    final = torch.load(paths.resume_state("ft"), weights_only=False)
+    assert kept["meta"]["metrics"]["epoch"] == 3
+    for k, v in final["model"].items():
+        assert torch.equal(kept["state_dict"][k], v)
+    with pytest.raises(ValueError, match="keep"):
+        train(LOG_SPEC, paths, "bad", TrainConfig(**TINY, keep="first"))
+
+
+def test_room_mic_preset_only_changes_the_mic_weight():
+    from whistle_house.data.training import config_for_mix
+
+    room = config_for_mix("finetune", ("whistle", "hum"), "room")
+    mic = config_for_mix("finetune", ("whistle", "hum"), "room-mic")
+    assert mic.interferer_weights["mic"] == 3 * room.interferer_weights["mic"]
+    mic.interferer_weights["mic"] = room.interferer_weights["mic"]
+    assert mic == room

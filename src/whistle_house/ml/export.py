@@ -5,7 +5,7 @@ extra) writes ``<name>.onnx`` next to ``<name>.pt``. The graph is one streaming 
 computation as ``WhistleNet.forward_stream`` followed by the sigmoids:
 
     inputs   x (1, T, F) normalised frames, any T >= 1;  s0..sN  each block's last input frames
-    outputs  presence (1, T, K) and salience (1, T, K, F) probabilities;  n0..nN  the new state
+    outputs  presence (1, T, K + A) and salience (1, T, K, F) probabilities;  n0..nN  the new state
 
 Everything else a detector needs travels in the file's metadata (key ``whistle_house``, JSON):
 the architecture, the normalisation stats, the front end the model was trained on, and the
@@ -73,6 +73,8 @@ class OnnxStream:
         self.frontend: dict = info["frontend"]
         self.source: dict = info["source"]  # {"name", "sha256"} of the .pt it came from
         self.classes: tuple[str, ...] = tuple(self.arch["classes"])
+        # presence-only outputs (e.g. "speech"): presence columns after the classes
+        self.aux: tuple[str, ...] = tuple(self.arch.get("aux", ()))
         self.lookahead: int = int(self.arch["lookahead"])
         self.n_bins: int = int(self.arch["n_bins"])
         inputs = self.session.get_inputs()
@@ -86,7 +88,7 @@ class OnnxStream:
     def stream(
         self, x: np.ndarray, state: list[np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
-        """Next frames of a stream. x: (1, T, F) normalised float32. Returns presence (T, K)
+        """Next frames of a stream. x: (1, T, F) normalised float32. Returns presence (T, K + A)
         and salience (T, K, F) probabilities, delayed by ``lookahead`` frames, + the new state."""
         feed = {self._x: x, **{name: s for (name, _), s in zip(self._states, state, strict=True)}}
         pres, sal, *new_state = self.session.run(None, feed)

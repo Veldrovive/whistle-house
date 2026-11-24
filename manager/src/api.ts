@@ -243,6 +243,7 @@ export type DatasetsInfo = {
   root: string | null // WHISTLE_HOUSE_EXTERNAL; usually null on the Pi
   datasets: DatasetStatus[]
   mixes: Record<string, Record<string, number>>
+  augments: Record<string, Record<string, unknown>> // channel / room simulation presets
 }
 
 /** Per-bin noise statistics measured from silence recordings (spectral_gate / adaptive_gate). */
@@ -367,6 +368,9 @@ export const api = {
     steps_per_epoch: number
     batch_size: number
     mix: string
+    augment: string
+    keep: string
+    aux: string[] // presence-only outputs to train as well: 'speech'
     external: string[]
     init_from?: string
     workers: number

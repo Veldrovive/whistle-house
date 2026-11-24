@@ -23,6 +23,12 @@ A model with several classes (the ``harmonic`` arch: whistle + hum) reports ever
 class (``whistle_f1``, ``hum_false_positive_rate``, ...); the unprefixed ones (``f1`` etc.) are
 the mean over classes, so checkpoint selection and the overfitting signals work the same way.
 
+``aux`` (``--aux speech``) adds presence-only outputs: a ``speech`` head trained on where the
+speech interferers sound (``data/training.speech_labels``; frames labelled -1 are left out of
+its loss). Its metrics are reported as ``speech_f1`` etc. and are not part of the mean that
+picks the checkpoint. A fine-tune keeps the outputs of its checkpoint and can add the head to
+one that has none (``model.add_aux``).
+
 When fine-tuning (``init_from``) the starting checkpoint is validated first as epoch 0 and is
 the initial "best", so a fine-tune can never return something worse on ``val`` than it started
 from. ``patience`` stops a run once ``val`` F1 has not improved for that many validations.
@@ -64,6 +70,8 @@ from whistle_house.ml.model import (
     ARCHS,
     WhistleNet,
     WhistleNetConfig,
+    add_aux,
+    config_from_dict,
     load_checkpoint,
     log_bins_per_octave,
     save_checkpoint,
@@ -90,12 +98,23 @@ class TrainConfig:
     arch: str = "small"
     # sounds to detect (data/training.CLASSES); empty = the arch's own (whistle, or whistle+hum)
     classes: list[str] = field(default_factory=list)
+    # presence-only outputs to add (data/training.AUX_CLASSES: speech); empty = none, or the
+    # ones the init checkpoint has
+    aux: list[str] = field(default_factory=list)
+    aux_weight: float = 1.0
     salience_weight: float = 1.0
     device: str = "auto"  # auto | cpu | cuda | mps
     mix: str = "mic"  # data mix preset: mic | pretrain | finetune (data/training.MIX_PRESETS)
+    # channel / room simulation laid over the mix: v1 | channel | room (AUGMENT_PRESETS)
+    augment: str = "v1"
     external: list[str] = field(default_factory=list)  # external dataset names to use
     init_from: str | None = None  # checkpoint to fine-tune from (path or name in models/)
     patience: int = 0  # stop after this many validations without a better val F1 (0 = never)
+    # Which epoch becomes <name>.pt: "best" (highest val F1) or "last". val is mostly external
+    # data, so on a mic fine-tune "best" is often the init checkpoint or an epoch from the LR
+    # warm-up that has hardly moved; "last" with a schedule that runs to its end (patience 0)
+    # keeps what the fine-tune learned. Then judge it on recordings, not on val.
+    keep: str = "best"
     workers: int = 4  # example-generation processes (0 = in the main process)
     wandb_project: str | None = None  # log to this Weights & Biases project (ml/tracking.py)
     wandb_group: str | None = None  # wandb group (warmstart: pretrain + fine-tune together)
@@ -188,8 +207,10 @@ def _class_metrics(p: np.ndarray, est_hz: np.ndarray, f0: np.ndarray) -> dict:
 def _evaluate(
     model: WhistleNet, x: np.ndarray, f0: np.ndarray, freqs: np.ndarray, norm, dev
 ) -> dict:
-    """x (B, T, F), f0 (B, T, K) -> metrics. With one class: that class's metrics. With several:
-    the mean over classes under the plain names, plus ``<class>_<metric>`` for each."""
+    """x (B, T, F), f0 (B, T, K + A) -> metrics. With one class: that class's metrics. With
+    several: the mean over classes under the plain names, plus ``<class>_<metric>`` for each.
+    The A presence-only outputs (``cfg.aux``; labels 1 / 0 / -1 = ignore) add
+    ``<name>_precision`` / ``_recall`` / ``_f1`` / ``_false_positive_rate``, outside the mean."""
     model.eval()
     pres_parts, bin_parts = [], []
     with torch.no_grad():
@@ -203,11 +224,29 @@ def _evaluate(
     classes = model.cfg.classes
     per = [_class_metrics(p[..., k], est_hz[..., k], f0[..., k]) for k in range(len(classes))]
     if len(classes) == 1:
-        return per[0]
-    out = {key: float(np.mean([m[key] for m in per])) for key in per[0]}
-    for name, m in zip(classes, per, strict=True):
-        out.update({f"{name}_{key}": v for key, v in m.items()})
+        out = per[0]
+    else:
+        out = {key: float(np.mean([m[key] for m in per])) for key in per[0]}
+        for name, m in zip(classes, per, strict=True):
+            out.update({f"{name}_{key}": v for key, v in m.items()})
+    for a, name in enumerate(model.cfg.aux, start=len(classes)):
+        out.update(
+            {f"{name}_{key}": v for key, v in _presence_metrics(p[..., a], f0[..., a]).items()}
+        )
     return out
+
+
+def _presence_metrics(p: np.ndarray, target: np.ndarray) -> dict:
+    """Frame metrics of a presence-only output: p predicted, target 1 / 0 / -1 (= ignored)."""
+    ok, t = target >= 0, target > 0.5
+    tp, fp, fn = (p & t & ok).sum(), (p & ~t & ok).sum(), (~p & t & ok).sum()
+    prec, rec = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
+    return {
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(2 * prec * rec / max(prec + rec, 1e-9)),
+        "false_positive_rate": float(fp / max((~t & ok).sum(), 1)),
+    }
 
 
 def _resolve_checkpoint(ref: str, paths: Paths) -> Path:
@@ -234,7 +273,8 @@ def _load_resume(path: Path, frontend: dict, cfg: TrainConfig) -> dict:
     rs = torch.load(path, map_location="cpu", weights_only=False)
     if rs["frontend"] != frontend:
         raise ValueError(f"{path}: the run was started on a different front-end; can't resume")
-    old, new = rs["status"]["config"], asdict(cfg)
+    # a state written before a setting existed ran with that setting's default
+    old, new = {**asdict(TrainConfig()), **rs["status"]["config"]}, asdict(cfg)
     changed = sorted(k for k in new if k not in _RESUME_FREE and old.get(k) != new[k])
     if changed:
         diff = ", ".join(f"{k}: {old.get(k)!r} -> {new[k]!r}" for k in changed)
@@ -247,6 +287,8 @@ def train(
 ) -> Path:
     """Train ``name`` and return its best checkpoint. ``resume``: continue an interrupted run
     from its resume state if there is one (else start fresh); return at once if it finished."""
+    if cfg.keep not in ("best", "last"):
+        raise ValueError(f"keep must be 'best' or 'last', got {cfg.keep!r}")
     torch.manual_seed(cfg.seed)
     status_path = paths.models / f"{name}.json"
     ckpt_path = paths.models / f"{name}.pt"
@@ -292,17 +334,22 @@ def train(
                     f"pipeline it came from ({init[2]['frontend']})"
                 )
             classes = tuple(init[1].cfg.classes)  # a fine-tune keeps the checkpoint's outputs
+            if cfg.aux:  # ... and may add presence-only ones to a checkpoint without any
+                init = (init[0], add_aux(init[1], tuple(cfg.aux)), init[2])
+            aux = tuple(init[1].cfg.aux)
         else:
             if cfg.arch not in ARCHS:
                 raise ValueError(f"unknown arch {cfg.arch!r}; choose from {sorted(ARCHS)}")
             classes = tuple(cfg.classes) or tuple(ARCHS[cfg.arch].get("classes", ("whistle",)))
+            aux = tuple(cfg.aux)
         status["classes"] = list(classes)
+        status["aux"] = list(aux)
         net_cfg = (
             init[1].cfg
             if init is not None
             else WhistleNetConfig(**{"channels": cfg.channels, **ARCHS[cfg.arch]})
         )
-        gcfg = config_for_mix(cfg.mix, classes)
+        gcfg = config_for_mix(cfg.mix, classes, cfg.augment, aux=aux)
         window_s = _window_seconds(net_cfg, spec, paths.root, gcfg.window_s)
         gcfg = replace(gcfg, window_s=window_s)
         status["window_s"] = window_s
@@ -372,11 +419,7 @@ def train(
         dev = _pick_device(cfg.device)
         status["device"] = str(dev)
         if rs is not None:  # same architecture and normalisation as the interrupted run
-            arch = dict(rs["arch"])
-            for key in ("dilations", "dilations_f", "classes", "harmonics"):
-                if key in arch:
-                    arch[key] = tuple(arch[key])
-            model = WhistleNet(WhistleNetConfig(**arch))
+            model = WhistleNet(config_from_dict(rs["arch"]))
             model.load_state_dict(rs["model"])
             norm = tuple(rs["norm"])
         elif init is not None:
@@ -386,7 +429,7 @@ def train(
         else:
             xs, _ = gen.batch(np.random.default_rng(cfg.seed), 16)
             norm = (float(xs.mean()), float(xs.std() + 1e-6))
-            arch = {"channels": cfg.channels, **ARCHS[cfg.arch], "classes": classes}
+            arch = {"channels": cfg.channels, **ARCHS[cfg.arch], "classes": classes, "aux": aux}
             if arch.get("harmonics"):  # harmonic input: multiples are bin shifts on a log axis
                 arch["bins_per_octave"] = log_bins_per_octave(freqs)
             model = WhistleNet(WhistleNetConfig(n_bins=len(freqs), **arch))
@@ -430,6 +473,7 @@ def train(
                 "pipeline": spec.name,
                 "frontend": frontend,
                 "classes": list(classes),
+                "aux": list(aux),
                 "params": status["params"],
                 "data": status["data"],
             },
@@ -467,20 +511,24 @@ def train(
                 state_path,
             )
 
+        def save_model(metrics: dict) -> None:
+            meta = {
+                "metrics": metrics,
+                "mix": cfg.mix,
+                "augment": cfg.augment,
+                "external": cfg.external,
+                "data": status["data"],
+            }
+            save_checkpoint(ckpt_path, model.cpu(), norm, frontend, meta)
+            model.to(dev)
+
         def keep_if_best(metrics: dict) -> bool:
             nonlocal best
             if metrics["f1"] <= best:
                 return False
             best = metrics["f1"]
             status["best"] = metrics
-            meta = {
-                "metrics": metrics,
-                "mix": cfg.mix,
-                "external": cfg.external,
-                "data": status["data"],
-            }
-            save_checkpoint(ckpt_path, model.cpu(), norm, frontend, meta)
-            model.to(dev)
+            save_model(metrics)
             return True
 
         if cfg.init_from and rs is None:  # baseline: the checkpoint we start from, untouched
@@ -498,17 +546,29 @@ def train(
             for i in range(cfg.steps_per_epoch):
                 x, f0 = next(batches)
                 x, f0 = x.numpy(), f0.numpy()
-                pres_t, sal_t = _targets(f0, freqs)
+                nk = len(classes)
+                pres_t, sal_t = _targets(f0[..., :nk], freqs)
                 x_t = torch.from_numpy((x - norm[0]) / norm[1]).float().to(dev)
                 pres, sal = model(x_t)
                 pres_t, sal_t = torch.from_numpy(pres_t).to(dev), torch.from_numpy(sal_t).to(dev)
                 # every class: presence everywhere, pitch only in the frames where it sounds
-                loss_p = F.binary_cross_entropy_with_logits(pres, pres_t)
+                loss_p = F.binary_cross_entropy_with_logits(pres[..., :nk], pres_t)
                 mask = pres_t[..., None].expand_as(sal)
                 loss_s = (
                     F.binary_cross_entropy_with_logits(sal, sal_t, reduction="none") * mask
                 ).sum() / (mask.sum() + 1)
                 loss = loss_p + cfg.salience_weight * loss_s
+                loss_a = None
+                if aux:  # presence-only outputs: every frame whose label is not "ignore" (-1)
+                    aux_t = torch.from_numpy(f0[..., nk:]).to(dev)
+                    known = (aux_t >= 0).float()
+                    loss_a = (
+                        F.binary_cross_entropy_with_logits(
+                            pres[..., nk:], aux_t.clamp(min=0), reduction="none"
+                        )
+                        * known
+                    ).sum() / (known.sum() + 1)
+                    loss = loss + cfg.aux_weight * loss_a
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -522,6 +582,7 @@ def train(
                             "loss": np.mean(losses[-cfg.log_every :]),
                             "loss_presence": loss_p.item(),
                             "loss_salience": loss_s.item(),
+                            **({"loss_aux": loss_a.item()} if loss_a is not None else {}),
                             "lr": sched.get_last_lr()[0],
                         },
                         "train/",
@@ -542,6 +603,10 @@ def train(
                 break
             write_status()
             save_state(epoch + 1)
+        if cfg.keep == "last" and status["history"]:  # <name>.pt = where training ended
+            save_model(status["history"][-1])
+            status["kept"] = {"epoch": status["history"][-1]["epoch"], "which": "last"}
+            log.info("kept the last epoch (%d) as %s", status["kept"]["epoch"], ckpt_path.name)
         status["state"] = "done"
         status["finished"] = time.time()
         write_status()

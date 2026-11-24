@@ -97,14 +97,16 @@ tr.sel, .item.sel { background: #24344a; }
 .spec canvas { image-rendering: pixelated; }
 .spec .ev { fill: none; stroke: #5aa9ff; stroke-width: 2.5; }
 .spec .ev.active { stroke-dasharray: 4 3; stroke: #9fd0ff; }
-.spec .ev.kind-hum { stroke: #ffa94d; }
-.spec .ev.active.kind-hum { stroke: #ffd29a; }
+.spec .ev.kind-hum { stroke: #35e0d0; }
+.spec .ev.active.kind-hum { stroke: #a5f3ec; }
 .spec .pitch { fill: none; stroke: #4be08a; stroke-width: 2; stroke-dasharray: 6 3; }
 .spec .score { fill: none; stroke: #4cc38a; stroke-width: 1.5; opacity: 0.9; }
 .spec .score.kind-whistle { stroke: #5aa9ff; }
-.spec .score.kind-hum { stroke: #ffa94d; }
+.spec .score.kind-hum { stroke: #35e0d0; }
+.spec .score.kind-speech { stroke: #d6b3ff; stroke-dasharray: 3 2; }
 .kind-whistle-text { color: #5aa9ff; }
-.kind-hum-text { color: #ffa94d; }
+.kind-hum-text { color: #35e0d0; }
+.kind-speech-text { color: #d6b3ff; }
 .spec .playhead { stroke: white; stroke-width: 1; }
 .spec .seg { fill: rgba(255, 255, 255, 0.08); }
 .spec .ticks { position: absolute; left: 4px; top: 0; bottom: 0; pointer-events: none; }

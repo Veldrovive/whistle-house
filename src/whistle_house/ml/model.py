@@ -6,6 +6,13 @@ Output, per class in ``cfg.classes`` (K of them: ``whistle``, and ``hum`` for mo
         salience logits (B, T, K, F) - "which frequency bin is its pitch in?" (for a hum: the
                                        fundamental, never a harmonic)
 
+``cfg.aux`` adds presence-only outputs (``speech``: "is someone talking in this frame?"), each
+one more column of the presence output after the K classes: presence is then (B, T, K + A) and
+salience stays (B, T, K, F). They read the same pooled features through their own linear head
+(``aux``), so a checkpoint without one loads into a model with one (``add_aux``), with its
+whistle / hum outputs unchanged. The ``learned`` detector uses ``speech`` to hold hums back
+while and shortly after someone talks.
+
 Convolutions are *causal in time* (only past frames are used), so the model can run on a stream:
 ``forward_stream`` takes new frames plus a small state (each block's last input frames) and
 gives exactly the offline result, computing every frame once.
@@ -56,7 +63,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +87,7 @@ class WhistleNetConfig:
     dilations_f: tuple[int, ...] = ()  # per-block frequency dilation; () = 1 everywhere
     lookahead: int = 0  # frames of future context (output is delayed by this much when streaming)
     classes: tuple[str, ...] = ("whistle",)  # one presence + salience output per class
+    aux: tuple[str, ...] = ()  # presence-only outputs after the classes (e.g. "speech")
     # Harmonic input: frequency multiples stacked as input channels (see module docstring).
     # () = the plain spectrogram as a single channel. Needs ``bins_per_octave`` of the (log)
     # frequency axis the model is trained on.
@@ -235,13 +243,17 @@ class WhistleNet(nn.Module):
         self.blocks = nn.Sequential(*blocks)
         self.salience = nn.Conv2d(c, k, 1)
         self.presence = nn.Linear(2 * c, k)
+        if len(set(cfg.aux)) != len(cfg.aux) or set(cfg.aux) & set(cfg.classes):
+            raise ValueError("aux must be distinct names that are not classes")
+        self.aux = nn.Linear(2 * c, len(cfg.aux)) if cfg.aux else None
 
     @property
     def receptive_field(self) -> int:
         return self.cfg.receptive_field
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(B, T, F) -> presence (B, T, K), salience (B, T, K, F), aligned with the input."""
+        """(B, T, F) -> presence (B, T, K + A), salience (B, T, K, F), aligned with the input
+        (A = the presence-only ``aux`` outputs, after the K classes)."""
         la = self.cfg.lookahead
         if not la:
             return self.forward_causal(x)
@@ -254,7 +266,10 @@ class WhistleNet(nn.Module):
     def _heads(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sal = self.salience(h).permute(0, 2, 1, 3)  # (B, T, K, F)
         pooled = torch.cat([h.mean(-1), h.amax(-1)], dim=1).transpose(1, 2)  # (B, T, 2C)
-        return self.presence(pooled), sal  # presence (B, T, K)
+        pres = self.presence(pooled)  # (B, T, K)
+        if self.aux is not None:
+            pres = torch.cat([pres, self.aux(pooled)], dim=-1)  # (B, T, K + A)
+        return pres, sal
 
     def forward_causal(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Strictly causal pass: output ``t`` is the prediction for frame ``t - lookahead``."""
@@ -303,10 +318,31 @@ def save_checkpoint(
 def load_checkpoint(path: Path) -> tuple[WhistleNet, dict]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     arch = dict(ck["arch"])
-    for key in ("dilations", "dilations_f", "classes", "harmonics"):
-        if key in arch:
-            arch[key] = tuple(arch[key])
-    model = WhistleNet(WhistleNetConfig(**arch))
+    model = WhistleNet(config_from_dict(arch))
     model.load_state_dict(ck["state_dict"])
     model.eval()
     return model, ck
+
+
+def config_from_dict(arch: dict) -> WhistleNetConfig:
+    """A config as stored in a checkpoint / resume state / ONNX metadata (lists for tuples;
+    fields added since it was written take their defaults)."""
+    arch = dict(arch)
+    for key in ("dilations", "dilations_f", "classes", "harmonics", "aux"):
+        if key in arch:
+            arch[key] = tuple(arch[key])
+    return WhistleNetConfig(**arch)
+
+
+def add_aux(model: WhistleNet, aux: tuple[str, ...]) -> WhistleNet:
+    """The same network with presence-only outputs ``aux`` (freshly initialised): every
+    existing weight is kept, so its whistle / hum outputs are what they were."""
+    if tuple(model.cfg.aux) == tuple(aux):
+        return model
+    if model.cfg.aux:
+        raise ValueError(f"the checkpoint already has aux outputs {model.cfg.aux}, not {aux}")
+    new = WhistleNet(replace(model.cfg, aux=tuple(aux)))
+    missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+    if unexpected or any(not k.startswith("aux.") for k in missing):
+        raise RuntimeError(f"add_aux: state mismatch ({missing}, {unexpected})")
+    return new.train(model.training)

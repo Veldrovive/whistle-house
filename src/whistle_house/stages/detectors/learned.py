@@ -8,6 +8,14 @@ A checkpoint has one output per kind of sound it was trained on (``whistle``; th
 arch adds ``hum``). Each kind gets its own contour tracker, so a hum never continues a whistle,
 and its events carry ``kind``.
 
+A checkpoint trained with a ``speech`` output (``train-detector --aux speech``: presence only,
+no pitch) also says per frame whether someone is talking. With ``speech_hold_s`` > 0 that
+holds back the kinds in ``speech_holds`` (hums by default: a spoken word can end like a hum,
+a whistle is never mistaken for speech): from the moment speech has lasted ``speech_min_s``
+until ``speech_hold_s`` after it was last heard, those kinds get no pitch candidates, and a
+note of theirs still sounding when speech is confirmed is dropped. The speech score is
+reported in ``kind_scores["speech"]`` either way.
+
 Frames go through the model once (``WhistleNet.forward_stream`` keeps the few past frames each
 layer needs), so the cost per chunk does not grow with the model's receptive field.
 
@@ -50,6 +58,7 @@ class _TorchBackend:
         self.norm: dict = ck["norm"]
         self.frontend: dict = ck["frontend"]
         self.classes: tuple[str, ...] = tuple(self.model.cfg.classes)
+        self.aux: tuple[str, ...] = tuple(self.model.cfg.aux)
         self.lookahead: int = self.model.cfg.lookahead
         self.n_bins: int = self.model.cfg.n_bins
 
@@ -95,6 +104,27 @@ class LearnedDetector(WhistleDetector):
             description="Kinds of sound to report, of those the checkpoint detects (whistle, "
             "hum). Empty = all of them",
         )
+        speech_hold_s: float = Field(
+            0.0,
+            ge=0,
+            description="Hold back hums (the kinds in speech_holds) while someone is talking "
+            "and for this many seconds after speech was last heard. Needs a checkpoint trained "
+            "with a speech output (--aux speech). 0 = off",
+        )
+        speech_threshold: float = Field(
+            0.5, description="Speech probability above which a frame counts as speech"
+        )
+        speech_min_s: float = Field(
+            0.1,
+            ge=0,
+            description="Speech must last this long before it holds anything back (a short "
+            "blip of the speech output inside a real hum does not count)",
+        )
+        speech_holds: list[str] = Field(
+            default_factory=lambda: ["hum"],
+            description="Kinds held back by speech. Whistles are not confused with speech, so "
+            "by default only hums are",
+        )
 
     def __init__(self, config: Config, ctx: StageContext):
         super().__init__(config, ctx)
@@ -139,6 +169,15 @@ class LearnedDetector(WhistleDetector):
         # (class index, kind) reported by this detector
         self.kinds = [(i, k) for i, k in enumerate(self.classes) if k in (config.kinds or [k])]
         self.lookahead = self.backend.lookahead
+        aux = tuple(getattr(self.backend, "aux", ()))
+        # presence column of the speech output (after the classes), if the checkpoint has one
+        self._speech = len(self.classes) + aux.index("speech") if "speech" in aux else None
+        if config.speech_hold_s > 0 and self._speech is None:
+            raise ValueError(
+                f"speech_hold_s needs a checkpoint with a speech output; {path.name} has none "
+                "(train with --aux speech, or set speech_hold_s to 0)"
+            )
+        self._held = {k for _, k in self.kinds if k in config.speech_holds}
         self.trackers = {
             k: ContourTracker(
                 config.max_jump_semitones, config.max_gap_frames, config.min_duration_s, kind=k
@@ -153,14 +192,16 @@ class LearnedDetector(WhistleDetector):
         self._state = self.backend.init_state()
         self._skip = self.lookahead  # causal outputs still to drop (they predate frame 0)
         self._times: list[float] = []  # times of frames whose prediction has not come out yet
+        self._speech_since: float | None = None  # start of the current run of speech frames
+        self._hold_until = -np.inf  # held kinds get no candidates up to this time
         self._axis = self.ctx.axis
 
     def _norm(self, values: np.ndarray) -> np.ndarray:
         return ((values - self.mean) / self.std).astype(np.float32)[None]
 
     def infer(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(T, F) -> presence prob (T, K), salience prob (T, K, F) for the model's K classes
-        (``self.classes``), aligned with the input frames. Stateless (offline): one causal pass
+        """(T, F) -> presence prob (T, K + A), salience prob (T, K, F) for the model's K classes
+        (``self.classes``; then its presence-only outputs), aligned with the input frames. Stateless (offline): one causal pass
         from a fresh state over the input plus ``lookahead`` frames of zeros (as
         ``WhistleNet.forward`` does), with the first ``lookahead`` outputs dropped."""
         la = self.lookahead
@@ -179,12 +220,23 @@ class LearnedDetector(WhistleDetector):
         c = self.config
         events: list[WhistleEvent] = []
         times, self._times = self._times[: len(pres)], self._times[len(pres) :]
+        hold = c.speech_hold_s > 0 and self._held
         for t, p, s in zip(times, pres, sal, strict=True):
+            if hold and p[self._speech] >= c.speech_threshold:
+                if self._speech_since is None:
+                    self._speech_since = float(t)
+                if t - self._speech_since >= c.speech_min_s:
+                    if t > self._hold_until:  # speech just confirmed: a note in progress was it
+                        for kind in self._held:
+                            self.trackers[kind].reset()
+                    self._hold_until = float(t) + c.speech_hold_s
+            else:
+                self._speech_since = None
             for i, kind in self.kinds:
                 tracker = self.trackers[kind]
                 thr = c.off_threshold if tracker.tracks else c.on_threshold
                 cands = []
-                if p[i] >= thr:
+                if p[i] >= thr and not (kind in self._held and t <= self._hold_until):
                     b = int(np.argmax(s[i]))
                     cands = [(self._axis.bin_to_hz(refine_peak(s[i], b)), float(p[i]))]
                 events.extend(tracker.step(float(t), cands))
@@ -203,9 +255,14 @@ class LearnedDetector(WhistleDetector):
         if len(pres):
             for i, k in self.kinds:
                 kind_scores[k][-len(pres) :] = pres[:, i]
+        frame_scores = np.max(list(kind_scores.values()), axis=0)
+        if self._speech is not None:  # shown next to the kinds; not a kind of event
+            kind_scores["speech"] = np.zeros(block.n_frames, np.float32)
+            if len(pres):
+                kind_scores["speech"][-len(pres) :] = pres[:, self._speech]
         return DetectorOutput(
             events=events,
-            frame_scores=np.max(list(kind_scores.values()), axis=0),
+            frame_scores=frame_scores,
             active=[e for tr in self.trackers.values() for e in tr.active()],
             kind_scores=kind_scores,
         )

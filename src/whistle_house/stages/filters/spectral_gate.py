@@ -105,6 +105,13 @@ class SpectralGate(Filter):
                 )
         self._mu, self._sigma = mu, sigma
 
+    def set_profile(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """Gate against these per-bin noise statistics instead of a stored profile (training
+        makes gated examples this way, with a profile measured on each example's background)."""
+        self._mu = np.asarray(mean, np.float32)
+        self._sigma = np.asarray(std, np.float32)
+        self.reset()
+
     def reset(self) -> None:
         self._level: np.ndarray | None = None  # smoothed (x - mu)
         self._mask: np.ndarray | None = None

@@ -21,7 +21,7 @@ const PROBE_METRICS = [
 const CURVES = [
   { key: 'f1', label: 'val F1 (generalisation; picks the checkpoint)', color: '#4ea1ff' },
   { key: 'whistle_f1', label: 'val F1, whistles', color: '#9fd0ff' },
-  { key: 'hum_f1', label: 'val F1, hums', color: '#ffa94d' },
+  { key: 'hum_f1', label: 'val F1, hums', color: '#35e0d0' },
   { key: 'mic_train_f1', label: 'F1 on the mic clips being trained on', color: '#ff9f43' },
   { key: 'mic_val_f1', label: 'F1 on held-out mic clips', color: '#3ddc97' },
 ]
@@ -150,6 +150,9 @@ export function Models() {
     steps_per_epoch: 100,
     batch_size: 16,
     mix: 'mic',
+    augment: 'v1',
+    keep: 'best',
+    speech_head: false,
     external: [] as string[],
     init_from: '',
     workers: 2,
@@ -222,6 +225,29 @@ export function Models() {
               ))}
             </select>
           </label>
+          <label title="How every training example is put through a microphone and a room. v1: the first recipe (reverb on the whistle / hum only, mild EQ). channel: v1 plus a random frequency response per source. room: random frequency response and the same reverb on speech and other interferers too, noise under speech, and one loudness range for every example. Use room for a model that must reject speech on a microphone it was not trained on: with v1 the model told hums from speech by how much energy sits above the fundamental, which another microphone shifts by 15 dB or more. room-mic: room, with this microphone's own speech / noise clips drawn three times as often; for the fine-tune. room-gate / room-mic-gate: the same with a steady room background (mains hum, fan) under the examples and half of them passed through a noise gate, for a model whose pipeline has a spectral_gate or adaptive_gate (train on the pipeline without the gate).">
+            augment{' '}
+            <select value={form.augment} onChange={(e) => setForm({ ...form, augment: e.target.value })}>
+              {Object.keys(datasets.data?.augments ?? { v1: {} }).map((k) => (
+                <option key={k}>{k}</option>
+              ))}
+            </select>
+          </label>
+          <label title="Which epoch becomes the model. best: the one with the highest validation F1. last: where training ended. Validation is mostly external data, so when fine-tuning on mic clips 'best' is often the starting checkpoint; use last with patience 0 and a short schedule (e.g. 20 epochs of 100 steps), then judge the model on recordings.">
+            keep{' '}
+            <select value={form.keep} onChange={(e) => setForm({ ...form, keep: e.target.value })}>
+              <option>best</option>
+              <option>last</option>
+            </select>
+          </label>
+          <label title="Also train a speech output: one more head on the model that says, per frame, whether someone is talking (no pitch). The learned detector can then hold hums back while and shortly after speech is heard (its speech_hold_s setting), so a word that ends like a hum is not a note. When fine-tuning, the head is added to a checkpoint that has none.">
+            <input
+              type="checkbox"
+              checked={form.speech_head}
+              onChange={(e) => setForm({ ...form, speech_head: e.target.checked })}
+            />{' '}
+            speech head
+          </label>
           <label title="small: the ~7k-parameter causal whistle model for the Pi. large: a ~190k-parameter whistle reference model with lookahead, to see how well detection can be done. harmonic: whistles + hums (~31k parameters); needs a pipeline with a log-frequency transform (stft_log) and no noise_floor filter, which swallows held hums. harmonic_deep: the same with twice the blocks (~60k parameters, 1.45 s of context instead of 0.73 s), about twice the cost. harmonic_long: 12 blocks (~75k parameters) with 2.9 s of context and 0.37 s of lookahead instead of 0.14 s, so its events arrive later (set the recognizer's settle_s to 0.5); trains on 4.5 s windows, so it needs more memory per batch. Ignored when fine-tuning (the checkpoint's architecture is kept).">
             model{' '}
             <select value={form.arch} onChange={(e) => setForm({ ...form, arch: e.target.value })} disabled={!!form.init_from}>
@@ -277,6 +303,7 @@ export function Models() {
                     pipeline: form.pipeline || undefined,
                     init_from: form.init_from || undefined,
                     wandb_project: form.wandb_project || undefined,
+                    aux: form.speech_head ? ['speech'] : [],
                   }),
                 )
                 .then(models.reload)

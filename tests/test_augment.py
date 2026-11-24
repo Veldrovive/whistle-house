@@ -137,3 +137,94 @@ def test_finetune_mix_augments_training_but_not_validation(tmp_path):
     aug = always._positive(src.mic_positives[0], 3 * SR, np.random.default_rng(1), mic=True)[1]
     assert set(np.round(raw[raw > 0], 1)) <= orig
     assert not set(np.round(aug[aug > 0], 1)) <= orig
+
+
+# --------------------------------------------------------------------------- channel and room
+
+
+def test_random_channel_changes_balance_not_pitch_or_loudness():
+    from whistle_house.data.augment import channel_response_db, random_channel, rms
+
+    t = np.arange(SR) / SR
+    x = (0.2 * np.sin(2 * np.pi * 150 * t) + 0.2 * np.sin(2 * np.pi * 1200 * t)).astype(np.float32)
+    ratios = []
+    for seed in range(20):
+        y = random_channel(x, SR, np.random.default_rng(seed))
+        assert len(y) == len(x) and abs(rms(y) / rms(x) - 1) < 1e-3
+        spec = np.abs(np.fft.rfft(y * np.hanning(len(y))))
+        ratios.append(20 * np.log10(spec[1200] / spec[150]))
+        for k in (150, 1200):  # still the same two tones
+            assert spec[k] > 10 * max(spec[k - 8], spec[k + 8])
+    # the balance between a fundamental and the mid band moves by tens of dB across draws
+    assert max(ratios) - min(ratios) > 25
+    g = channel_response_db(np.geomspace(60, 4000, 50), np.random.default_rng(0))
+    assert np.abs(np.diff(g)).max() < 6  # smooth: no narrow notches
+
+
+def test_room_reverb_has_the_requested_direct_to_reverb_ratio():
+    from whistle_house.data.augment import room_reverb
+
+    x = np.zeros(SR, np.float32)
+    x[0] = 1.0
+    for drr in (-6.0, 6.0, 18.0):
+        y = room_reverb(x, SR, np.random.default_rng(1), rt60_s=(0.5, 0.5), drr_db=(drr, drr))
+        got = 10 * np.log10(y[0] ** 2 / np.sum(y[1:] ** 2))
+        assert abs(got - drr) < 0.5
+
+
+def test_room_preset_keeps_labels_and_sets_one_level_range():
+    """`--augment room`: labels still follow the audio, and a lone interferer is as loud as an
+    example with a whistle in it (level must not tell the classes apart)."""
+    from whistle_house.data.augment import active_level_db
+
+    spec = PipelineSpec(
+        transform={"name": "stft_log", "params": {}}, filters=[], detector={"name": "peak_tracker"}
+    )
+    cfg = config_for_mix("mic", ("whistle", "hum"), "room")
+    assert cfg.p_channel > 0 and cfg.room_reverb and cfg.level_dbfs == (-65.0, -10.0)
+    assert config_for_mix("mic", ("whistle", "hum")).p_channel == 0  # v1 stays the old recipe
+    gen = ExampleGenerator(spec.frontend_dict(), TrainingSources(), cfg)
+    rng = np.random.default_rng(0)
+    for _ in range(6):
+        x, f0 = gen.example(rng)
+        assert np.isfinite(x).all() and x.shape[0] == f0.shape[0] and f0.shape[1] == 2
+
+    # a clean synthetic whistle through reverb + channel: the loudest bin is still the label
+    clean = replace(
+        cfg,
+        p_interferer=0.0,
+        p_synth_whistle=1.0,
+        p_synth_hum=0.0,
+        p_mic_whistle=0.0,
+        p_mic_hum=0.0,
+        p_whistle_overtones=0.0,
+        p_saturate=0.0,
+    )
+    gen = ExampleGenerator(spec.frontend_dict(), TrainingSources(), clean)
+    freqs = gen.axis.freqs
+    ok = n = 0
+    for _ in range(8):
+        x, f0 = gen.example(rng)
+        on = f0[:, 0] > 0
+        est = freqs[x[on].argmax(1)]
+        ok += int((np.abs(12 * np.log2(est / f0[on, 0])) < 1.0).sum())
+        n += int(on.sum())
+    assert n > 200 and ok / n > 0.8
+
+    # level: the example's loud parts land in the configured range, with or without a positive
+    class Probe(ExampleGenerator):
+        def example_audio(self, rng):
+            self.frontend.process_signal = lambda mix: (_ for _ in ()).throw(_Stop(mix))
+            try:
+                self.example(rng)
+            except _Stop as s:
+                return s.args[0]
+
+    class _Stop(Exception):
+        pass
+
+    for share in (0.0, 1.0):
+        c = replace(cfg, p_synth_whistle=share, p_synth_hum=0.0, p_mic_whistle=0.0, p_mic_hum=0.0)
+        probe = Probe(spec.frontend_dict(), TrainingSources(), c)
+        levels = [active_level_db(probe.example_audio(rng), SR) for _ in range(12)]
+        assert -68 < min(levels) and max(levels) < -8

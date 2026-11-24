@@ -112,7 +112,10 @@ def _train_config(args, **overrides):
             "val_examples": args.val_examples,
             "patience": args.patience,
             "arch": args.arch,
+            "augment": args.augment,
+            "keep": args.keep,
             "classes": _classes(args.classes),
+            "aux": _classes(args.aux),
             "wandb_project": args.wandb_project,
             "wandb_group": getattr(args, "wandb_group", None),
             **overrides,
@@ -468,6 +471,33 @@ def main(argv: list[str] | None = None) -> None:
             default=os.environ.get("WHISTLE_HOUSE_WANDB_PROJECT") or None,
             help="log metrics to this Weights & Biases project (needs the wandb extra; default: "
             "$WHISTLE_HOUSE_WANDB_PROJECT, else off)",
+        )
+        p.add_argument(
+            "--augment",
+            default="v1",
+            help="channel / room simulation of the training examples: v1 (the first recipe) | "
+            "channel (+ random frequency response per source) | room (+ reverb on speech too, "
+            "noise under speech, one level distribution: use this for a model that must "
+            "reject speech on another microphone) | room-mic (room, with this mic's own "
+            "negatives drawn 3x as often: for the fine-tune) | room-gate, room-mic-gate (the "
+            "same with a steady room background under the examples and half of them passed "
+            "through a noise gate: for a model used behind spectral_gate / adaptive_gate)",
+        )
+        p.add_argument(
+            "--aux",
+            default="",
+            help="presence-only outputs to train as well, comma-separated: speech (a head that "
+            "says whether someone is talking; the learned detector can hold hums back with it, "
+            "see its speech_hold_s). With --init-from the head is added to a checkpoint that "
+            "has none",
+        )
+        p.add_argument(
+            "--keep",
+            default="best",
+            choices=["best", "last"],
+            help="which epoch becomes <name>.pt: best (highest val F1) | last. For a mic "
+            "fine-tune use last with --patience 0 and a short schedule: val is mostly external "
+            "data and 'best' is often the init checkpoint",
         )
         p.add_argument(
             "--resume",
